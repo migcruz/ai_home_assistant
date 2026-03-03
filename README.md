@@ -23,11 +23,12 @@ graph TB
             Web["onyx-web Next.js UI :3000"]
             API["onyx-api FastAPI Backend :8080"]
             BG["onyx-background Indexing Workers"]
-            MS["onyx-model-server Embedding Models :9000"]
+            IMS["inference-model-server Embeddings :9000"]
+            IDXMS["indexing-model-server Embeddings"]
         end
 
         subgraph Infra["Infrastructure"]
-            PG[(PostgreSQL Relational DB)]
+            PG[(PostgreSQL Files + State)]
             Vespa[(Vespa Vector Index)]
             Redis[(Redis Cache / Queue)]
         end
@@ -38,7 +39,7 @@ graph TB
             GPU["RTX 5090 32GB VRAM"]
         end
 
-        subgraph Storage["File Storage"]
+        subgraph Storage["File Storage (future)"]
             Local["Local Directories /home /Documents etc"]
             Net["Network Shares SMB / NFS"]
             NAS["NAS (optional) TrueNAS / Synology"]
@@ -61,10 +62,11 @@ graph TB
     BG --> PG
     BG --> Vespa
     BG --> Redis
-    BG -->|"embed chunks"| MS
-    BG -.->|"reads"| Local
-    BG -.->|"reads"| Net
-    BG -.->|"reads"| NAS
+    BG -->|"embed chunks"| IMS
+    BG -->|"index chunks"| IDXMS
+    BG -.->|"reads (future)"| Local
+    BG -.->|"reads (future)"| Net
+    BG -.->|"reads (future)"| NAS
 
     Net -.->|"mount"| NAS
     Ollama --> Model
@@ -81,10 +83,11 @@ graph TB
 | **UI** | Onyx Web (Next.js) | Chat interface, connector config, admin panel |
 | **API** | Onyx Backend (FastAPI) | RAG orchestration, query routing, auth |
 | **Workers** | Onyx Background | Crawls and indexes connected file sources |
-| **Embeddings** | Onyx Model Server | Converts text chunks to vectors for semantic search |
-| **Vector Store** | Vespa | Stores and searches document embeddings |
-| **Database** | PostgreSQL | Users, connectors, conversation history |
-| **Cache** | Redis | Task queue for background jobs |
+| **Inference Embeddings** | inference-model-server | Embeds queries at chat time |
+| **Indexing Embeddings** | indexing-model-server | Embeds documents during background indexing |
+| **Vector Store** | Vespa `8.609.39` | Stores and searches document embeddings |
+| **Database** | PostgreSQL `15.2` | Users, connectors, conversation history, file storage |
+| **Cache** | Redis `7.4` | Task queue for background jobs |
 | **LLM Serving** | Ollama | Hosts Llama 4 Scout, GPU-accelerated inference |
 | **Model** | Llama 4 Scout | 17B active-param MoE, fits in 32GB VRAM |
 
@@ -117,10 +120,24 @@ bash scripts/init.sh
 # 3. Start the full stack
 docker compose up -d
 
-# 4. Open the UI
+# 4. Open the UI (Vespa takes ~2 min on first boot — be patient)
 # Local:   http://localhost
 # Network: http://<your-host-ip>
 ```
+
+---
+
+## First Run
+
+After the stack is up, open **http://localhost** and:
+
+1. **Create your admin account** — enter an email and password (used for `AUTH_TYPE=basic` login)
+2. **Skip connector setup** — you can add file connectors later
+3. **Verify the LLM** — go to **Admin → LLM Providers** and confirm Ollama + `llama4:scout` is listed. If not, add it manually:
+   - Provider: `Ollama`
+   - API Base: `http://ollama:11434`
+   - Model: `llama4:scout`
+4. **Start chatting** — first response loads the model into VRAM and will be slower; subsequent ones are fast
 
 ---
 
@@ -133,7 +150,7 @@ bash scripts/test.sh
 bash scripts/test.sh --verbose
 ```
 
-Tests cover: container health, all service endpoints, model availability, live GPU inference (reports tokens/sec), and `nvidia-smi` inside the Ollama container.
+Tests cover: container health (10 containers), all service endpoints, model availability, live GPU inference (reports tokens/sec), and `nvidia-smi` inside the Ollama container.
 
 ---
 
@@ -145,9 +162,11 @@ All config lives in `.env` (generated from `.env.example` by `init.sh`):
 |---|---|---|
 | `LLM_MODEL` | `llama4:scout` | Primary Ollama model for chat + RAG |
 | `LLM_FAST_MODEL` | `llama4:scout` | Model for lightweight tasks (routing, classification) |
-| `AUTH_TYPE` | `disabled` | Set to `basic` or `google_oauth` for multi-user |
+| `AUTH_TYPE` | `basic` | Auth method — `basic`, `google_oauth`, `saml`, or `oidc` |
 | `WEB_DOMAIN` | `http://localhost` | Public URL — update to your host IP for LAN access |
 | `LOG_LEVEL` | `info` | `debug` for development |
+
+> **Note:** `AUTH_TYPE=disabled` is no longer supported in current Onyx versions.
 
 ---
 
@@ -169,10 +188,10 @@ Then add a **Local File connector** in the Onyx admin UI pointing at `/mnt/index
 ## Deployment Phases
 
 ```
-Phase 1 (Now)      Run on gaming PC for local dev and testing
+Phase 1 (Now)      Run on gaming PC — stack is working
 Phase 2            Move stack to homelab rack — same compose file, update WEB_DOMAIN
 Phase 3            Add Tailscale for secure remote access outside the home
-Phase 4            Add NAS, persistent memory, home automation integrations
+Phase 4            Add NAS, file indexing, persistent memory, home automation hooks
 ```
 
 ---
@@ -187,9 +206,21 @@ To make the assistant reachable by name instead of IP:
 
 ---
 
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `onyx-api` crash-loops on start | `ENCRYPTION_KEY_SECRET` wrong length | Must be exactly 32 chars — re-run `openssl rand -hex 16` and update `.env` |
+| `onyx-vespa` slow to become healthy | Vespa takes 2-3 min on first boot | Wait — healthcheck allows up to 5 min |
+| Model missing after `docker compose down -v` | `-v` deletes the `ollama_data` volume | Re-run `docker exec onyx-ollama ollama pull llama4:scout` |
+| Containers conflict on re-deploy | Old named containers still exist | Run `docker compose down --remove-orphans` before `up` |
+| `ValueError: 'local' is not a valid FileStoreType` | Invalid `FILE_STORE_BACKEND` value | Use `postgres` (no MinIO needed) or `s3` (requires MinIO) |
+
+---
+
 ## Security Notes
 
-- Set `AUTH_TYPE=basic` (or stronger) before exposing to more than one user
-- Volume mounts use `:ro` (read-only) — the container cannot modify your files
+- `AUTH_TYPE=basic` is the default — change to `google_oauth` or `oidc` for stronger auth
+- Volume mounts use `:ro` (read-only) — containers cannot modify your files
 - Exclude sensitive paths from indexing (`.ssh`, credential files, browser profiles)
 - Never expose ports 8080, 11434, 19071, or 5432 directly to the internet

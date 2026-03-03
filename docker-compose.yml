@@ -1,0 +1,238 @@
+# Home AI Assistant — Onyx BYOM + Ollama (RTX 5090)
+# Based on: https://github.com/onyx-dot-app/onyx/blob/main/deployment/docker_compose/docker-compose.yml
+# Changes from upstream: Ollama GPU backend, FILE_STORE_BACKEND=local (no MinIO), custom nginx
+
+name: onyx
+
+services:
+
+  # ── LLM Backend (GPU) ──────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: onyx-ollama
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      OLLAMA_NUM_PARALLEL: "2"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+  # Service names must match Onyx's internal defaults (relational_db, index, cache)
+  relational_db:
+    image: postgres:15.2-alpine
+    container_name: onyx-postgres
+    restart: unless-stopped
+    shm_size: 1g
+    command: -c 'max_connections=250'
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+    volumes:
+      - db_volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  index:
+    image: vespaengine/vespa:8.609.39
+    container_name: onyx-vespa
+    restart: unless-stopped
+    environment:
+      - VESPA_SKIP_UPGRADE_CHECK=true
+    volumes:
+      - vespa_volume:/opt/vespa/var
+    ports:
+      - "19071:19071"
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:19071/state/v1/health | grep -q '\"status\":\"up\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+
+  cache:
+    image: redis:7.4-alpine
+    container_name: onyx-redis
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    tmpfs:
+      - /data
+
+  # ── Onyx Embedding Model Servers ───────────────────────────────────────────
+  # Two separate instances: one for live inference, one for background indexing
+  inference_model_server:
+    image: onyxdotapp/onyx-model-server:latest
+    container_name: onyx-inference-model-server
+    restart: unless-stopped
+    command: >
+      /bin/sh -c "uvicorn model_server.main:app --host 0.0.0.0 --port 9000"
+    ports:
+      - "9000:9000"
+    volumes:
+      - model_cache_huggingface:/app/.cache/huggingface/
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/api/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  indexing_model_server:
+    image: onyxdotapp/onyx-model-server:latest
+    container_name: onyx-indexing-model-server
+    restart: unless-stopped
+    command: >
+      /bin/sh -c "uvicorn model_server.main:app --host 0.0.0.0 --port 9000"
+    environment:
+      - INDEXING_ONLY=True
+    volumes:
+      - indexing_huggingface_model_cache:/app/.cache/huggingface/
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/api/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  # ── Onyx Application ───────────────────────────────────────────────────────
+  background:
+    image: onyxdotapp/onyx-backend:latest
+    container_name: onyx-background
+    restart: unless-stopped
+    command: >
+      /bin/sh -c "/app/scripts/supervisord_entrypoint.sh"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # ── Service hostnames (must match compose service names) ──
+      - POSTGRES_HOST=relational_db
+      - VESPA_HOST=index
+      - REDIS_HOST=cache
+      - MODEL_SERVER_HOST=inference_model_server
+      - INDEXING_MODEL_SERVER_HOST=indexing_model_server
+      # ── BYOM — Ollama ─────────────────────────────────────────
+      - FILE_STORE_BACKEND=postgres
+      - GEN_AI_MODEL_PROVIDER=ollama
+      - GEN_AI_MODEL_VERSION=${LLM_MODEL:-llama4:scout}
+      - GEN_AI_API_ENDPOINT=http://ollama:11434
+      - FAST_GEN_AI_MODEL_VERSION=${LLM_FAST_MODEL:-llama4:scout}
+      - USE_LIGHTWEIGHT_BACKGROUND_WORKER=true
+    depends_on:
+      - relational_db
+      - index
+      - cache
+      - inference_model_server
+      - indexing_model_server
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - background_logs:/var/log/onyx
+      - file-system:/app/file-system
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "6"
+
+  api_server:
+    image: onyxdotapp/onyx-backend:latest
+    container_name: onyx-api
+    restart: unless-stopped
+    command: >
+      /bin/sh -c "alembic upgrade head &&
+      echo 'Starting Onyx API Server' &&
+      uvicorn onyx.main:app --host 0.0.0.0 --port 8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # ── Service hostnames (must match compose service names) ──
+      - POSTGRES_HOST=relational_db
+      - VESPA_HOST=index
+      - REDIS_HOST=cache
+      - MODEL_SERVER_HOST=inference_model_server
+      # ── BYOM — Ollama ─────────────────────────────────────────
+      - FILE_STORE_BACKEND=postgres
+      - GEN_AI_MODEL_PROVIDER=ollama
+      - GEN_AI_MODEL_VERSION=${LLM_MODEL:-llama4:scout}
+      - GEN_AI_API_ENDPOINT=http://ollama:11434
+      - FAST_GEN_AI_MODEL_VERSION=${LLM_FAST_MODEL:-llama4:scout}
+    depends_on:
+      relational_db:
+        condition: service_healthy
+      index:
+        condition: service_started
+      cache:
+        condition: service_started
+      inference_model_server:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"
+    volumes:
+      - api_server_logs:/var/log/onyx
+      - file-system:/app/file-system
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 25s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "6"
+
+  web_server:
+    image: onyxdotapp/onyx-web-server:latest
+    container_name: onyx-web
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - INTERNAL_URL=http://api_server:8080
+    depends_on:
+      - api_server
+    ports:
+      - "3000:3000"
+
+  nginx:
+    image: nginx:1.25.5-alpine
+    container_name: onyx-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - web_server
+      - api_server
+
+volumes:
+  ollama_data:
+  db_volume:
+  vespa_volume:
+  model_cache_huggingface:
+  indexing_huggingface_model_cache:
+  api_server_logs:
+  background_logs:
+  file-system:

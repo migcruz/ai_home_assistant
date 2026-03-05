@@ -1,28 +1,28 @@
+import '../style.css';
+
 // ── State ────────────────────────────────────────────────────────────────────
-let ws = null;
-let mediaRecorder = null;
-let audioChunks = [];
+let ws: WebSocket | null = null;
+let mediaRecorder: MediaRecorder | null = null;
 let isRecording = false;
 let isBusy = false;
-let currentAssistantBubble = null;
-let currentAudio = null;
+let currentAudio: AudioBufferSourceNode | null = null;
 
 // Active turn state — set when a response is being received.
-let activeBubble = null;
-let activeCursor = null;
-let activeTextNode = null;
+let activeBubble: HTMLElement | null = null;
+let activeCursor: HTMLElement | null = null;
+let activeTextNode: Text | null = null;
 let fullText = '';
 // Audio playback queue for the current turn.
-let audioQueue = [];      // Blob[]
+let audioQueue: Blob[] = [];
 let audioDone = false;
-let notifyPlayer = null;
-let playerPromise = null;
+let notifyPlayer: (() => void) | null = null;
+let playerPromise: Promise<void> | null = null;
 
 // ── Audio device warmup ───────────────────────────────────────────────────────
-let _audioCtx = null;
-function ensureAudioWarm() {
+let _audioCtx: AudioContext | null = null;
+function ensureAudioWarm(): void {
   if (_audioCtx) return;
-  _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  _audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
   const osc = _audioCtx.createOscillator();
   const gain = _audioCtx.createGain();
   gain.gain.value = 0;
@@ -33,33 +33,33 @@ function ensureAudioWarm() {
 }
 
 // ── DOM ──────────────────────────────────────────────────────────────────────
-const conversation = document.getElementById('conversation');
+const conversation = document.getElementById('conversation')!;
 const emptyState = document.getElementById('empty-state');
-const statusBadge = document.getElementById('status-badge');
-const micBtn = document.getElementById('mic-btn');
-const textInput = document.getElementById('text-input');
-const sendBtn = document.getElementById('send-btn');
-const visualizer = document.getElementById('visualizer');
-const errorToast = document.getElementById('error-toast');
+const statusBadge = document.getElementById('status-badge')!;
+const micBtn = document.getElementById('mic-btn') as HTMLButtonElement;
+const textInput = document.getElementById('text-input') as HTMLTextAreaElement;
+const sendBtn = document.getElementById('send-btn') as HTMLButtonElement;
+const visualizer = document.getElementById('visualizer')!;
+const errorToast = document.getElementById('error-toast')!;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-function setStatus(label, color) {
+function setStatus(label: string, color?: string): void {
   statusBadge.textContent = label;
   statusBadge.style.color = color || '';
   statusBadge.style.borderColor = color || '';
 }
 
-function showError(msg) {
+function showError(msg: string): void {
   errorToast.textContent = msg;
   errorToast.classList.add('show');
   setTimeout(() => errorToast.classList.remove('show'), 4000);
 }
 
-function hideEmpty() {
-  if (emptyState) emptyState.remove();
+function hideEmpty(): void {
+  emptyState?.remove();
 }
 
-function addMessage(role, text) {
+function addMessage(role: 'user' | 'assistant', text: string): HTMLElement {
   hideEmpty();
   const wrap = document.createElement('div');
   wrap.className = `message ${role}`;
@@ -79,7 +79,7 @@ function addMessage(role, text) {
   return bubble;
 }
 
-function startStreamingMessage() {
+function startStreamingMessage(): { bubble: HTMLElement; cursor: HTMLElement; textNode: Text } {
   hideEmpty();
   const wrap = document.createElement('div');
   wrap.className = 'message assistant';
@@ -102,21 +102,20 @@ function startStreamingMessage() {
   wrap.appendChild(bubble);
   conversation.appendChild(wrap);
   conversation.scrollTop = conversation.scrollHeight;
-  currentAssistantBubble = bubble;
   return { bubble, cursor, textNode };
 }
 
 // ── Audio playback ──────────────────────────────────────────────────────────
 
-async function playBlob(blob) {
+async function playBlob(blob: Blob): Promise<void> {
   ensureAudioWarm();
-  if (_audioCtx.state === 'suspended') await _audioCtx.resume();
+  if (_audioCtx!.state === 'suspended') await _audioCtx!.resume();
   const arrayBuffer = await blob.arrayBuffer();
-  const audioBuffer = await _audioCtx.decodeAudioData(arrayBuffer);
-  await new Promise((resolve, reject) => {
-    const source = _audioCtx.createBufferSource();
+  const audioBuffer = await _audioCtx!.decodeAudioData(arrayBuffer);
+  await new Promise<void>((resolve, reject) => {
+    const source = _audioCtx!.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(_audioCtx.destination);
+    source.connect(_audioCtx!.destination);
     source.onended = () => { currentAudio = null; resolve(); };
     currentAudio = source;
     try { source.start(); } catch (e) { reject(e); }
@@ -124,7 +123,7 @@ async function playBlob(blob) {
 }
 
 // Plays queued audio blobs in order. Runs concurrently with incoming messages.
-async function runPlayer() {
+async function runPlayer(): Promise<void> {
   let idx = 0;
   while (true) {
     if (idx < audioQueue.length) {
@@ -133,26 +132,33 @@ async function runPlayer() {
     } else if (audioDone) {
       break;
     } else {
-      await new Promise(r => { notifyPlayer = r; });
+      await new Promise<void>(r => { notifyPlayer = r; });
     }
   }
 }
 
-function enqueueAudio(blob) {
+function enqueueAudio(blob: Blob): void {
   audioQueue.push(blob);
   if (notifyPlayer) { notifyPlayer(); notifyPlayer = null; }
 }
 
-function finishAudio() {
+function finishAudio(): void {
   audioDone = true;
   if (notifyPlayer) { notifyPlayer(); notifyPlayer = null; }
 }
 
 // ── WebSocket connection ─────────────────────────────────────────────────────
 
+interface ServerMessage {
+  type: 'transcript' | 'token' | 'done' | 'error';
+  text?: string;
+  content?: string;
+  detail?: string;
+}
+
 let reconnectDelay = 1000;
 
-function connectWS() {
+function connectWS(): void {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/voice/converse`);
   ws.binaryType = 'arraybuffer';
@@ -160,8 +166,7 @@ function connectWS() {
   ws.onopen = () => {
     setStatus('idle');
     reconnectDelay = 1000;
-    // Send initial config
-    ws.send(JSON.stringify({ type: 'config', tts: true }));
+    ws!.send(JSON.stringify({ type: 'config', tts: true }));
   };
 
   ws.onclose = () => {
@@ -175,7 +180,7 @@ function connectWS() {
     ws?.close();
   };
 
-  ws.onmessage = (event) => {
+  ws.onmessage = (event: MessageEvent) => {
     // Binary frame = TTS audio
     if (event.data instanceof ArrayBuffer) {
       const blob = new Blob([event.data], { type: 'audio/wav' });
@@ -184,21 +189,20 @@ function connectWS() {
     }
 
     // Text frame = JSON message
-    let msg;
-    try { msg = JSON.parse(event.data); } catch (_) { return; }
+    let msg: ServerMessage;
+    try { msg = JSON.parse(event.data as string); } catch { return; }
 
     switch (msg.type) {
       case 'transcript':
-        // STT result — show as user message
-        addMessage('user', msg.text);
+        addMessage('user', msg.text!);
         setStatus('generating…', '#5b7cf6');
         beginResponseBubble();
         break;
 
       case 'token':
         if (!activeTextNode) beginResponseBubble();
-        fullText += msg.content;
-        activeTextNode.textContent = fullText;
+        fullText += msg.content!;
+        activeTextNode!.textContent = fullText;
         conversation.scrollTop = conversation.scrollHeight;
         break;
 
@@ -214,30 +218,28 @@ function connectWS() {
   };
 }
 
-function beginResponseBubble() {
-  if (activeTextNode) return;  // already started
+function beginResponseBubble(): void {
+  if (activeTextNode) return;
   const { bubble, cursor, textNode } = startStreamingMessage();
   activeBubble = bubble;
   activeCursor = cursor;
   activeTextNode = textNode;
   fullText = '';
 
-  // Start audio player for this turn.
   audioQueue = [];
   audioDone = false;
   notifyPlayer = null;
   playerPromise = runPlayer().catch(() => {});
 }
 
-async function finishTurn() {
-  if (activeCursor) activeCursor.remove();
+async function finishTurn(): Promise<void> {
+  activeCursor?.remove();
   if (activeBubble && !fullText.trim()) activeBubble.textContent = '[No response]';
   activeBubble = null;
   activeCursor = null;
   activeTextNode = null;
   fullText = '';
 
-  // Wait for all audio to finish playing.
   finishAudio();
   if (playerPromise) await playerPromise;
   playerPromise = null;
@@ -249,7 +251,7 @@ async function finishTurn() {
 
 // ── Send message (text input) ───────────────────────────────────────────────
 
-function sendMessage(userText) {
+function sendMessage(userText: string): void {
   if (!userText.trim() || isBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
   isBusy = true;
   micBtn.disabled = true;
@@ -263,25 +265,23 @@ function sendMessage(userText) {
 
 // ── Microphone recording ──────────────────────────────────────────────────────
 
-async function startRecording() {
+async function startRecording(): Promise<void> {
   if (isBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
-  let stream;
+  let stream: MediaStream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (e) {
+  } catch {
     showError('Microphone access denied. Allow mic in browser settings.');
     return;
   }
 
-  audioChunks = [];
   const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
     ? 'audio/webm;codecs=opus'
     : 'audio/webm';
 
   mediaRecorder = new MediaRecorder(stream, { mimeType });
 
-  // Send audio chunks to server as they arrive.
-  mediaRecorder.ondataavailable = async (e) => {
+  mediaRecorder.ondataavailable = async (e: BlobEvent) => {
     if (e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(await e.data.arrayBuffer());
     }
@@ -297,14 +297,14 @@ async function startRecording() {
     }
   };
 
-  mediaRecorder.start(250);  // send chunks every 250ms
+  mediaRecorder.start(250);
   isRecording = true;
   micBtn.classList.add('listening');
   visualizer.classList.add('active');
   setStatus('listening…', '#e05b5b');
 }
 
-function stopRecording() {
+function stopRecording(): void {
   if (!mediaRecorder || !isRecording) return;
   mediaRecorder.stop();
   isRecording = false;
@@ -339,7 +339,7 @@ sendBtn.addEventListener('click', () => {
   }
 });
 
-textInput.addEventListener('keydown', e => {
+textInput.addEventListener('keydown', (e: KeyboardEvent) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     const text = textInput.value.trim();

@@ -100,6 +100,12 @@ graph TB
 
 ---
 
+## 1.3 Design Constraints
+
+1. **Frontend/Backend Separation** — User-facing services must separate frontend (UI) and backend (API/logic) into distinct layers. Frontend code lives in its own directory with its own build toolchain (e.g., `frontend/` with Vite + TypeScript), and backend code is never coupled to a specific UI. This promotes modularity: any client (web, mobile, Pi agent) can consume the same backend API without reimplementing server-side logic. Build artifacts (HTML, JS, CSS) are generated at container build time and served as static assets.
+
+---
+
 ## 2. User Experience Design
 
 ### 2.1 Desktop Browser UI

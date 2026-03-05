@@ -1,3 +1,12 @@
+# ── Stage 1: Build frontend ──────────────────────────────────────────────────
+FROM node:22-slim AS frontend
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ .
+RUN npm run build
+
+# ── Stage 2: Python runtime ─────────────────────────────────────────────────
 FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -16,7 +25,7 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Download Piper voice model at build time so startup is instant
@@ -26,7 +35,9 @@ RUN mkdir -p /app/.cache/piper && \
     curl -L -o /app/.cache/piper/en_US-lessac-medium.onnx.json \
         "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
 
-COPY . .
+COPY backend/ .
+# Copy Vite build output as the static assets directory
+COPY --from=frontend /static ./static
 
 EXPOSE 8765
 

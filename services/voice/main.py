@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from converse import router as converse_router
 from synthesize import load_voice, synthesize
 from transcribe import load_model, transcribe
 
@@ -20,6 +21,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(converse_router)
 
 STATIC_DIR = Path(__file__).parent / "static"
 

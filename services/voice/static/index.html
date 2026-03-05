@@ -445,7 +445,70 @@ async function ensureSession() {
   chatSessionId = data.chat_session_id;
 }
 
-// ── Send message → stream response → synthesize ──────────────────────────────
+// ── TTS pipeline helpers ──────────────────────────────────────────────────────
+
+// Kick off a TTS fetch immediately; returns Promise<Blob> so the player can
+// await it just before playback — synthesis and LLM streaming overlap.
+function fetchAudio(text) {
+  return fetch('/voice/synthesize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  }).then(r => { if (!r.ok) throw new Error('TTS failed'); return r.blob(); });
+}
+
+async function playBlob(blob) {
+  // Ensure context exists and is active.
+  ensureAudioWarm();
+  if (_audioCtx.state === 'suspended') await _audioCtx.resume();
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioBuffer = await _audioCtx.decodeAudioData(arrayBuffer);
+  await new Promise((resolve, reject) => {
+    const source = _audioCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(_audioCtx.destination);
+    source.onended = () => { currentAudio = null; resolve(); };
+    currentAudio = source;
+    try { source.start(); } catch (e) { reject(e); }
+  });
+}
+
+// Split accumulated text into complete sentences + trailing fragment.
+// Requires the next char to be uppercase to avoid splitting abbreviations
+// like "Dr. Smith" or decimal numbers.
+function extractSentences(text, isEnd = false) {
+  const sentences = [];
+  const parts = text.split(/(?<=[.!?])\s+(?=[A-Z"'])/);
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (parts[i].trim()) sentences.push(parts[i].trim());
+  }
+  const last = parts[parts.length - 1].trim();
+  if (isEnd && last) sentences.push(last);
+  return { sentences, remaining: isEnd ? '' : last };
+}
+
+// Parse one NDJSON/SSE line from the Onyx stream; return token text or null.
+function extractToken(line) {
+  const raw = line.startsWith('data: ') ? line.slice(6).trim() : line.trim();
+  if (!raw || raw === '[DONE]') return null;
+  try {
+    const packet = JSON.parse(raw);
+    if (packet.obj?.type === 'message_delta' && packet.obj.content) {
+      return packet.obj.content;
+    }
+  } catch (_) {}
+  return null;
+}
+
+// ── Send message → stream response → synthesize (pipelined) ──────────────────
+//
+// How it works:
+//   1. LLM tokens stream in; sentence boundaries are detected on the fly.
+//   2. Each complete sentence immediately kicks off fetchAudio() — a TTS HTTP
+//      request that runs concurrently while the LLM keeps generating.
+//   3. A player coroutine runs in parallel: it awaits each audio promise in
+//      order and plays them back-to-back. By the time sentence 1 finishes
+//      playing, sentence 2's audio is often already fetched and ready.
 async function sendMessage(userText) {
   if (!userText.trim() || isBusy) return;
   isBusy = true;
@@ -466,6 +529,34 @@ async function sendMessage(userText) {
   setStatus('generating…', '#5b7cf6');
   const { bubble, cursor, textNode } = startStreamingMessage();
   let fullText = '';
+
+  // Queue of in-flight TTS promises, one per sentence, in order.
+  const audioQueue = [];  // Promise<Blob>[]
+  let llmDone = false;
+  let notifyPlayer = null;
+
+  function enqueue(sentence) {
+    audioQueue.push(fetchAudio(sentence));
+    // Wake the player if it's waiting for the next item.
+    if (notifyPlayer) { notifyPlayer(); notifyPlayer = null; }
+  }
+
+  // Player runs concurrently with LLM streaming. It waits for each audio
+  // promise in order, playing as soon as each one resolves.
+  const playerDone = (async () => {
+    let idx = 0;
+    while (true) {
+      if (idx < audioQueue.length) {
+        setStatus('speaking…', '#5be07a');
+        try { await playBlob(await audioQueue[idx++]); } catch (e) { console.error('TTS playback error:', e); }
+      } else if (llmDone) {
+        break;
+      } else {
+        // Queue empty but LLM still running — sleep until next sentence arrives.
+        await new Promise(r => { notifyPlayer = r; });
+      }
+    }
+  })().catch(() => {});
 
   try {
     const resp = await fetch('/api/chat/send-message', {
@@ -491,87 +582,57 @@ async function sendMessage(userText) {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-
-    const processLine = (line) => {
-      // Onyx streams NDJSON; tolerate SSE "data: " prefix too
-      const raw = line.startsWith('data: ') ? line.slice(6).trim() : line.trim();
-      if (!raw || raw === '[DONE]') return;
-      try {
-        const packet = JSON.parse(raw);
-        if (packet.obj?.type === 'message_delta' && packet.obj.content) {
-          fullText += packet.obj.content;
-          textNode.textContent = fullText;
-          conversation.scrollTop = conversation.scrollHeight;
-        }
-      } catch (_) { /* skip malformed packets */ }
-    };
+    let pending = '';  // accumulates tokens until a sentence boundary
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        // Flush any remaining buffered content when stream ends
-        if (buffer.trim()) processLine(buffer);
+        // Flush any partial line left in the decoder buffer.
+        if (buffer.trim()) {
+          const token = extractToken(buffer);
+          if (token) { fullText += token; pending += token; textNode.textContent = fullText; }
+        }
+        // Flush the trailing sentence fragment (no terminal punctuation needed).
+        const { sentences } = extractSentences(pending, true);
+        for (const s of sentences) enqueue(s);
         break;
       }
+
       buffer += decoder.decode(value, { stream: true });
-
       const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) processLine(line);
+      buffer = lines.pop();  // hold back incomplete last line
+
+      for (const line of lines) {
+        const token = extractToken(line);
+        if (token) {
+          fullText += token;
+          textNode.textContent = fullText;
+          conversation.scrollTop = conversation.scrollHeight;
+          pending += token;
+          // Fire TTS for each complete sentence immediately.
+          const { sentences, remaining } = extractSentences(pending);
+          for (const s of sentences) enqueue(s);
+          pending = remaining;
+        }
+      }
     }
   } catch (e) {
-    bubble.textContent = '[Error: ' + e.message + ']';
-    showError(e.message);
-    isBusy = false;
-    micBtn.disabled = false;
-    setStatus('idle');
-    return;
-  }
-
-  cursor.remove();
-  if (!fullText.trim()) {
-    bubble.textContent = '[No response]';
-    isBusy = false;
-    micBtn.disabled = false;
-    setStatus('idle');
-    return;
-  }
-
-  // ── TTS playback — sentence-by-sentence to avoid audio warmup cutoff ────────
-  setStatus('speaking…', '#5be07a');
-  try {
-    // Split on sentence boundaries; keeps punctuation with the sentence
-    const sentences = fullText
-      .split(/(?<=[.!?])\s+/)
-      .map(s => s.trim())
-      .filter(s => s.length > 0);
-    if (sentences.length === 0) sentences.push(fullText);
-
-    for (const sentence of sentences) {
-      const ttsResp = await fetch('/voice/synthesize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: sentence }),
-      });
-      if (!ttsResp.ok) throw new Error('TTS failed');
-      const audioBlob = await ttsResp.blob();
-      const audioUrl = URL.createObjectURL(audioBlob);
-      await new Promise((resolve, reject) => {
-        currentAudio = new Audio(audioUrl);
-        currentAudio.onended = () => { URL.revokeObjectURL(audioUrl); resolve(); };
-        currentAudio.onerror = () => { URL.revokeObjectURL(audioUrl); reject(new Error('Playback error')); };
-        currentAudio.play().catch(reject);
-      });
-      currentAudio = null;
+    if (!fullText) {
+      bubble.textContent = '[Error: ' + e.message + ']';
+      showError(e.message);
     }
-  } catch (e) {
-    showError('TTS failed — response shown as text only');
   } finally {
-    setStatus('idle');
-    isBusy = false;
-    micBtn.disabled = false;
-    currentAudio = null;
+    cursor.remove();
+    llmDone = true;
+    if (notifyPlayer) { notifyPlayer(); notifyPlayer = null; }
   }
+
+  await playerDone;
+
+  if (!fullText.trim()) bubble.textContent = '[No response]';
+  setStatus('idle');
+  isBusy = false;
+  micBtn.disabled = false;
 }
 
 // ── Microphone recording ──────────────────────────────────────────────────────
@@ -654,7 +715,7 @@ micBtn.addEventListener('click', () => {
   } else {
     // Stop any playing audio when user starts recording
     if (currentAudio) {
-      currentAudio.pause();
+      currentAudio.stop();  // AudioBufferSourceNode.stop() fires onended
       currentAudio = null;
       isBusy = false;
       micBtn.disabled = false;

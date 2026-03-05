@@ -10,10 +10,10 @@ Every device on your WiFi (PC, laptop, phone) connects to a single URL and gets 
 
 ```mermaid
 graph LR
-    Devices["Any Device\n(browser · PWA · voice)"]
-    Butler["Home AI Butler\nDocker Stack"]
-    LLM["Llama 4 Scout\nRTX 5090 GPU"]
-    Future["Your Files &\nSmart Home\n(future phases)"]
+    Devices["Any Device (browser · PWA · voice)"]
+    Butler["Home AI Butler Docker Stack"]
+    LLM["Llama 4 Scout RTX 5090 GPU"]
+    Future["Your Files & Smart Home (future phases)"]
 
     Devices -->|home network| Butler
     Butler --> LLM

@@ -226,6 +226,27 @@ services:
     depends_on:
       - web_server
       - api_server
+      - voice-service
+
+  # ── Voice Service (STT + TTS) ───────────────────────────────────────────────
+  voice-service:
+    build: ./services/voice
+    container_name: onyx-voice
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - WHISPER_MODEL=medium
+      - PIPER_VOICE=en_US-lessac-medium
+      - CACHE_DIR=/app/.cache
+    volumes:
+      - voice_model_cache:/app/.cache
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/voice/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 volumes:
   ollama_data:
@@ -236,3 +257,4 @@ volumes:
   api_server_logs:
   background_logs:
   file-system:
+  voice_model_cache:

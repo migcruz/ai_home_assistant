@@ -1,7 +1,7 @@
 # Technical Specification — Home AI Assistant
 
 **Status:** Draft
-**Version:** 0.1
+**Version:** 0.2
 **Derives from:** [design-spec.md](design-spec.md)
 
 ---
@@ -47,31 +47,43 @@
 ### 2.1 Voice Service
 
 **Container:** `voice-service`
-**Base image:** `python:3.11-slim`
+**Base image:** `nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04`
 **Ports:** `8765` (internal only, proxied by Nginx)
 
-**Dependencies:**
+**Dependencies (`requirements.txt`):**
 ```
-faster-whisper       # GPU-accelerated Whisper inference
-piper-tts            # Local TTS
-fastapi
-uvicorn
-websockets
-soundfile
-numpy
+faster-whisper==1.1.1    # GPU-accelerated Whisper inference
+requests==2.32.3         # unlisted faster-whisper dependency
+piper-tts==1.2.0         # Local TTS
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.12 # multipart form upload for audio
+httpx==0.27.2
+soundfile==0.12.1
+numpy==1.26.4
 ```
 
-**Endpoints:**
+**Endpoints (implemented — Phase 4):**
 
 ```
+GET  /voice/
+  Response: text/html — voice chat UI (index.html)
+
+GET  /voice/health
+  Response: { "status": "ok" }
+
 POST /voice/transcribe
-  Body: audio/wav or audio/webm binary
+  Body: multipart/form-data — audio file (webm/wav)
   Response: { "text": "transcribed string" }
 
 POST /voice/synthesize
-  Body: { "text": "string to speak", "voice": "en_US-lessac-medium" }
+  Body: { "text": "string to speak" }
   Response: audio/wav binary
+```
 
+**Endpoints (planned — Phase 6, Pi agent):**
+
+```
 WS /voice/stream
   Bidirectional WebSocket:
   → Client sends: binary audio frames (16kHz mono PCM)
@@ -95,15 +107,25 @@ language = "en"              # auto-detect if multilingual needed
 
 **Nginx routing additions:**
 ```nginx
+# Lazy DNS resolution (resolver variable) so nginx starts even if voice-service
+# container is not yet running — Docker's embedded DNS is 127.0.0.11
 location /voice/ {
-    proxy_pass http://voice-service:8765/;
+    resolver 127.0.0.11 valid=10s;
+    set $voice_upstream "voice-service:8765";
+    proxy_pass http://$voice_upstream;   # no path suffix — nginx passes full URI as-is
     proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
     proxy_buffering off;
     proxy_read_timeout 120s;
+    proxy_send_timeout 120s;
 }
 ```
+
+> **Note:** When `proxy_pass` uses a variable, nginx passes the full original request URI
+> unchanged (unlike a literal upstream where path rewriting occurs). Appending a path suffix
+> to the variable proxy_pass URL causes double-path bugs (e.g. `/voice//voice/transcribe`).
+> Leave the proxy_pass URL without a trailing path.
 
 ---
 
@@ -291,7 +313,7 @@ Configure connectors in Onyx admin UI pointing to `/mnt/indexed/`.
 
 ---
 
-### Phase 4 — Voice Service
+### Phase 4 — Voice Service *(implemented)*
 
 Add to `docker-compose.yml`:
 
@@ -303,24 +325,34 @@ voice-service:
   runtime: nvidia              # Whisper uses GPU
   environment:
     - NVIDIA_VISIBLE_DEVICES=all
-    - ONYX_API_URL=http://api_server:8080
     - WHISPER_MODEL=medium
     - PIPER_VOICE=en_US-lessac-medium
+    - CACHE_DIR=/app/.cache
   volumes:
     - voice_model_cache:/app/.cache
-  ports:
-    - "8765:8765"
+  # No exposed ports — internal only, accessed via nginx proxy
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/voice/health')"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 60s
 ```
 
-Add to `nginx/nginx.conf`:
+Also add `voice_model_cache:` to the top-level `volumes:` section.
+
+Add to `nginx/nginx.conf` (see lazy DNS resolver note in §2.1):
 ```nginx
 location /voice/ {
-    proxy_pass http://voice-service:8765/;
+    resolver 127.0.0.11 valid=10s;
+    set $voice_upstream "voice-service:8765";
+    proxy_pass http://$voice_upstream;
     proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
     proxy_buffering off;
     proxy_read_timeout 120s;
+    proxy_send_timeout 120s;
 }
 ```
 
@@ -389,18 +421,18 @@ chime:
 
 Each phase is self-contained and can be stopped/started independently.
 
-| Phase | Key tasks | New files |
-|---|---|---|
-| **2 — Homelab** | Set static IP, update `WEB_DOMAIN`, `docker compose up` on rack | `docker-compose.yml` env update |
-| **3 — File Indexing** | Add volume mounts, configure connectors in Onyx UI | `docker-compose.yml` update |
-| **4 — Voice** | Build voice service, add Nginx route, add mic button to UI | `services/voice/`, Nginx update |
-| **5 — Smart Home** | Build HA Bridge, extend Onyx system prompt, add HA env vars | `services/ha-bridge/` |
-| **6 — Pi Agent** | Build Pi agent, deploy to Pi, add WebSocket Nginx route | `pi-agent/` |
-| **7 — Multi-user** | Add DB tables, build admin UI for user/profile management | DB migration, UI additions |
-| **8 — Phone Upload** | Add upload endpoint, connector for uploaded files | `services/voice/` or new service |
-| **9 — Network Shares** | Mount SMB/NFS, add connectors in Onyx | `docker-compose.yml` update |
-| **10 — Deep Media** | Add vision model service, update indexing pipeline | `services/vision/` |
-| **11 — Web Search** | Configure search API connector in Onyx admin | `.env` update |
+| Phase | Key tasks | New files | Status |
+|---|---|---|---|
+| **2 — Homelab** | Set static IP, update `WEB_DOMAIN`, `docker compose up` on rack | `docker-compose.yml` env update | — |
+| **3 — File Indexing** | Add volume mounts, configure connectors in Onyx UI | `docker-compose.yml` update | — |
+| **4 — Voice** | Build voice service, add Nginx route, standalone voice chat UI | `services/voice/`, Nginx update | **In progress** — text chat + TTS working; STT UI flow pending |
+| **5 — Smart Home** | Build HA Bridge, extend Onyx system prompt, add HA env vars | `services/ha-bridge/` | — |
+| **6 — Pi Agent** | Build Pi agent, deploy to Pi, add `WS /voice/stream` endpoint | `pi-agent/` | — |
+| **7 — Multi-user** | Add DB tables, build admin UI for user/profile management | DB migration, UI additions | — |
+| **8 — Phone Upload** | Add upload endpoint, connector for uploaded files | `services/voice/` or new service | — |
+| **9 — Network Shares** | Mount SMB/NFS, add connectors in Onyx | `docker-compose.yml` update | — |
+| **10 — Deep Media** | Add vision model service, update indexing pipeline | `services/vision/` | — |
+| **11 — Web Search** | Configure search API connector in Onyx admin | `.env` update | — |
 
 ---
 

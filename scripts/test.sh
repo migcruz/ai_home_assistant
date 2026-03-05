@@ -41,10 +41,10 @@ json_field() {
     body=$(curl -sf --max-time 10 "$url" 2>/dev/null || echo "{}")
     if echo "$body" | grep -q "$field"; then
         pass "$label"
-        $VERBOSE && echo "      response: $body" | head -c 300
+        $VERBOSE && echo "      response: $body" | head -c 300 || true
     else
         fail "$label (field '$field' not found)"
-        $VERBOSE && echo "      response: $body" | head -c 300
+        $VERBOSE && echo "      response: $body" | head -c 300 || true
     fi
 }
 
@@ -62,7 +62,7 @@ container_running() {
 info "1. Container health"
 for container in onyx-ollama onyx-postgres onyx-vespa onyx-redis \
                  onyx-inference-model-server onyx-indexing-model-server \
-                 onyx-background onyx-api onyx-web onyx-nginx; do
+                 onyx-background onyx-api onyx-web onyx-nginx onyx-voice; do
     container_running "$container"
 done
 
@@ -96,10 +96,10 @@ if echo "$RESPONSE" | grep -q '"response"'; then
             pass "Inference speed: ~${TPS} tokens/sec"
         fi
     fi
-    $VERBOSE && echo "      $(echo "$RESPONSE" | grep -o '"response":"[^"]*"')"
+    $VERBOSE && echo "      $(echo "$RESPONSE" | grep -o '"response":"[^"]*"')" || true
 else
     fail "Ollama inference failed or timed out"
-    $VERBOSE && echo "      response: $RESPONSE"
+    $VERBOSE && echo "      response: $RESPONSE" || true
 fi
 
 echo ""
@@ -111,12 +111,22 @@ info "6. Embedding model servers"
 json_field "http://localhost:9000/api/health" "status" "Inference model server returns status"
 
 echo ""
-info "7. GPU passthrough in Ollama container"
+info "7. Voice service"
+json_field "http://localhost/voice/health" '"status"' "Voice service health endpoint"
+http_ok "http://localhost/voice/"                  "Voice UI reachable"
+
+echo ""
+info "8. GPU passthrough in Ollama container"
 if docker exec onyx-ollama nvidia-smi &>/dev/null; then
     GPU_NAME=$(docker exec onyx-ollama nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-    pass "GPU visible in container: ${GPU_NAME:-unknown}"
+    pass "GPU visible in Ollama container: ${GPU_NAME:-unknown}"
 else
     fail "nvidia-smi not accessible in Ollama container — check NVIDIA Container Toolkit"
+fi
+if docker exec onyx-voice nvidia-smi &>/dev/null; then
+    pass "GPU visible in Voice container (Whisper can use GPU)"
+else
+    fail "nvidia-smi not accessible in Voice container — check NVIDIA Container Toolkit"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────

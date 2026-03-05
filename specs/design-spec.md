@@ -1,7 +1,7 @@
 # Design Specification — Home AI Assistant
 
 **Status:** Draft
-**Version:** 0.1
+**Version:** 0.2
 **Derives from:** [functional-spec.md](functional-spec.md)
 
 ---
@@ -104,7 +104,7 @@ graph TB
 
 ### 2.1 Desktop Browser UI
 
-Provided by Onyx out of the box. Key interactions:
+Provided by Onyx out of the box (unmodified — the Onyx web container is a pre-built image). Key interactions:
 
 ```
 ┌─────────────────────────────────────────┐
@@ -120,14 +120,46 @@ Provided by Onyx out of the box. Key interactions:
 │  Sources │                              │
 │  ──────  │                              │
 │  My Docs │   ┌─────────────────────┐   │
-│  Photos  │   │ Type a message...🎤 │   │
+│  Photos  │   │ Type a message...   │   │
 │  Videos  │   └─────────────────────┘   │
 │          │                              │
 └──────────┴──────────────────────────────┘
 ```
 
-- Mic button (🎤) in the message box activates **Voice Mode A**
 - Source citations are clickable, showing the originating file or document
+- **Voice Mode A** is not embedded in the Onyx UI (the container cannot be modified). Instead, it lives at a separate URL: `http://<host>/voice/` — see §2.1a below.
+
+### 2.1a Voice Chat UI (`/voice/`)
+
+A custom standalone single-page app served by the Voice Service at `http://<host>/voice/`.
+
+```
+┌───────────────────────────────────────────────┐
+│  ← Chat                         ● IDLE        │
+├───────────────────────────────────────────────┤
+│                                               │
+│              (empty state prompt)             │
+│                                               │
+│  ┌──────────────────────────────────────────┐ │
+│  │ AI  Barack Obama won the 2008 election…  │ │
+│  └──────────────────────────────────────────┘ │
+│                                               │
+├───────────────────────────────────────────────┤
+│  ┌───────────────────────────┐  [Send]        │
+│  │ Or type here…             │                │
+│  └───────────────────────────┘                │
+│                    [  🎤  ]                   │
+└───────────────────────────────────────────────┘
+```
+
+- Dark theme; conversation history with user / AI message bubbles
+- Large mic button: click to start recording, click again (or silence timeout) to stop
+- Status badge: IDLE / LISTENING / TRANSCRIBING / GENERATING / SPEAKING
+- Audio visualizer bar while recording
+- Text input fallback — can type instead of speak
+- "← Chat" link returns to the main Onyx UI
+- Reuses the active Onyx login session (`credentials: include`) — user must be logged into Onyx first
+- TTS plays back sentence-by-sentence for low latency; uses a persistent Web Audio `AudioContext` (zero-gain oscillator) to keep the OS audio device warm and prevent the first syllable from being clipped
 
 ### 2.2 Mobile PWA UI
 
@@ -162,18 +194,34 @@ Mobile-optimized single-column layout:
 
 ### 2.3 Voice Interaction Flows
 
-#### Mode A/B — Mic Button
+#### Mode A — Browser Voice Chat (`/voice/`)
 
 ```
-User taps 🎤
-    → UI shows "Listening..." with audio visualizer
-    → User speaks query
-    → User taps 🎤 again (or silence timeout)
-    → Audio sent to Voice Service
-    → Whisper transcribes → text shown in message box
-    → User can edit before sending, or auto-sends after 1s
-    → Response streams as normal
-    → TTS plays response audio through device speaker
+User navigates to http://<host>/voice/ (must be logged into Onyx at http://<host>/)
+    → Page creates a new Onyx chat session on load
+    → User clicks 🎤
+        → Web Audio AudioContext created (keeps audio device warm)
+        → Browser requests mic permission
+        → UI shows "Listening…" + audio visualizer
+        → MediaRecorder captures audio (webm/ogg)
+    → User clicks 🎤 again to stop (or silence timeout — future)
+        → Audio blob POSTed to POST /voice/transcribe
+        → Whisper transcribes on GPU → { "text": "..." }
+        → Transcript shown as user message bubble
+    → Text sent to Onyx API POST /api/chat/send-message (SSE/NDJSON stream)
+        → Streaming response tokens rendered in AI bubble in real time
+    → On stream complete → full response text POSTed sentence-by-sentence to POST /voice/synthesize
+        → Piper TTS returns WAV audio per sentence
+        → Browser plays each WAV sequentially via Audio element
+        → AudioContext prevents OS audio device warmup clipping on first sentence
+```
+
+#### Mode B — PWA Microphone (Mobile) *(planned)*
+
+```
+Same as Mode A but from the mobile PWA
+    → Initiated by tapping a mic button in the PWA
+    → Optimized for quick voice queries while on home WiFi
 ```
 
 #### Mode C — Ambient (Raspberry Pi)
@@ -305,11 +353,20 @@ The Voice Service is a new lightweight service added to the Docker stack.
 
 ### 5.2 Interfaces
 
+**Implemented (Phase 4):**
+
 | Interface | Protocol | Used by |
 |---|---|---|
-| `POST /voice/transcribe` | HTTP | Browser, PWA (uploads audio file) |
-| `WS /voice/stream` | WebSocket | Raspberry Pi (bidirectional audio stream) |
-| `POST /voice/synthesize` | HTTP | Internal — generates TTS audio from text |
+| `GET /voice/` | HTTP | Browser — serves standalone voice chat UI |
+| `GET /voice/health` | HTTP | Smoke tests, healthcheck |
+| `POST /voice/transcribe` | HTTP multipart | Voice UI — uploads recorded audio, returns transcript |
+| `POST /voice/synthesize` | HTTP JSON | Voice UI — sends text, returns audio/wav |
+
+**Planned (Phase 6 — Pi agent):**
+
+| Interface | Protocol | Used by |
+|---|---|---|
+| `WS /voice/stream` | WebSocket | Raspberry Pi — bidirectional audio stream (mic in, TTS out) |
 
 ### 5.3 Raspberry Pi Agent
 
@@ -348,16 +405,16 @@ The LLM is prompted with available Home Assistant entities and their capabilitie
 
 ## 7. Deployment Architecture by Phase
 
-| Phase | New components added |
-|---|---|
-| 1 (done) | Onyx + Ollama + infra |
-| 2 | Static LAN IP, `WEB_DOMAIN` update, homelab migration |
-| 3 | Host filesystem mounts, Onyx file connectors configured |
-| 4 | Voice Service container (Whisper + Piper) |
-| 5 | HA Bridge container, Home Assistant connection |
-| 6 | Raspberry Pi agent deployed, WebSocket route in Nginx |
-| 7 | Auth system expanded with household/child accounts and profiles |
-| 8 | Phone upload endpoint in Voice Service or dedicated upload handler |
-| 9 | SMB/NFS mounts added to docker-compose |
-| 10 | Vision model service added for photo indexing |
-| 11 | Web search connector configured in Onyx admin |
+| Phase | New components added | Status |
+|---|---|---|
+| 1 | Onyx + Ollama + infra | **Done** |
+| 2 | Static LAN IP, `WEB_DOMAIN` update, homelab migration | — |
+| 3 | Host filesystem mounts, Onyx file connectors configured | — |
+| 4 | Voice Service container (Whisper + Piper); standalone `/voice/` UI | **In progress** — text chat + TTS working; STT UI flow pending |
+| 5 | HA Bridge container, Home Assistant connection | — |
+| 6 | Raspberry Pi agent deployed, `WS /voice/stream` endpoint added | — |
+| 7 | Auth system expanded with household/child accounts and profiles | — |
+| 8 | Phone upload endpoint in Voice Service or dedicated upload handler | — |
+| 9 | SMB/NFS mounts added to docker-compose | — |
+| 10 | Vision model service added for photo indexing | — |
+| 11 | Web search connector configured in Onyx admin | — |

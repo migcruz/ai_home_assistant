@@ -29,9 +29,10 @@ section() { echo ""; echo -e "${BLUE}──${NC} $*"; }
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 http_ok() {
-    local url="$1" label="$2"
+    # http_ok <url> <label> [extra-curl-flags]
+    local url="$1" label="$2" extra="${3:-}"
     local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$url" 2>/dev/null || echo "000")
+    code=$(curl -s $extra -o /dev/null -w "%{http_code}" --max-time 10 "$url" 2>/dev/null || echo "000")
     if [[ "$code" =~ ^[23] ]]; then
         pass "$label (HTTP $code)"
     else
@@ -128,11 +129,25 @@ test_embedding_servers() {
 test_voice_service() {
     section "7. Voice service"
     json_field "https://localhost/voice/health" '"status"' "Voice service health endpoint" "-k"
-    http_ok "http://localhost/voice/" "Voice UI reachable"
+}
+
+test_webui() {
+    section "8. Web UI"
+    # Check the page loads and contains the expected HTML
+    json_field "https://localhost/voice/" "Voice Assistant" "Voice UI serves correct HTML" "-k"
+    # Extract the hashed JS asset URL from the built HTML and verify it loads
+    local html asset_path
+    html=$(curl -sk --max-time 10 "https://localhost/voice/" 2>/dev/null || echo "")
+    asset_path=$(echo "$html" | grep -o 'src="[^"]*assets[^"]*\.js"' | head -1 | sed 's/src="//;s/"//')
+    if [[ -n "$asset_path" ]]; then
+        http_ok "https://localhost${asset_path}" "Voice UI JS asset reachable" "-k"
+    else
+        fail "Voice UI JS asset not found in HTML"
+    fi
 }
 
 test_gpu_passthrough() {
-    section "8. GPU passthrough"
+    section "9. GPU passthrough"
     if docker exec onyx-ollama nvidia-smi &>/dev/null; then
         local gpu_name
         gpu_name=$(docker exec onyx-ollama nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
@@ -158,6 +173,7 @@ main() {
         test_onyx_api
         test_embedding_servers
         test_voice_service
+        test_webui
         test_gpu_passthrough
     )
 

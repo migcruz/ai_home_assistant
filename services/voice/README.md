@@ -1,8 +1,8 @@
 # Voice Service
 
-The Voice Service provides speech-to-text (STT), text-to-speech (TTS), and real-time voice chat capabilities for the Home AI Assistant. It exposes a WebSocket-based conversational API that any client — web browser, mobile PWA, or Raspberry Pi agent — can use to send audio or text and receive streamed LLM responses with synthesized speech.
+The Voice Service is a pure API backend providing speech-to-text (STT), text-to-speech (TTS), and real-time voice chat for the Home AI Assistant. Its companion frontend lives in [`services/webui`](../webui/).
 
-The service runs Whisper (via faster-whisper) for transcription and Piper for neural TTS, both on GPU. A server-side orchestrator handles the full STT → LLM → sentence detection → TTS pipeline so clients only need to speak the WebSocket wire protocol.
+It exposes a WebSocket-based conversational API that any client — web browser, mobile PWA, or Raspberry Pi agent — can use to send audio or text and receive streamed LLM responses with synthesized speech. The service runs Whisper (via faster-whisper) for transcription and Piper for neural TTS, both on GPU. A server-side orchestrator handles the full STT → LLM → sentence detection → TTS pipeline so clients only need to speak the WebSocket wire protocol.
 
 ---
 
@@ -20,13 +20,16 @@ graph TB
         Nginx["Nginx :80"]
     end
 
+    subgraph WebUI["Web UI :80 (nginx)"]
+        FE["Frontend Vite + TypeScript"]
+    end
+
     subgraph VoiceService["Voice Service :8765"]
         WS["WebSocket /voice/converse"]
         REST["REST API /voice/transcribe /voice/synthesize"]
         Orch["Orchestrator Pipeline Coordinator"]
         STT["Whisper STT faster-whisper (CUDA, float16)"]
         TTS["Piper TTS ONNX Runtime"]
-        FE["Frontend Vite + TypeScript"]
     end
 
     subgraph Core["Core Services"]
@@ -37,7 +40,8 @@ graph TB
     Browser -->|"WS, HTTP"| Nginx
     PWA -->|"WS, HTTP"| Nginx
     Pi -->|"WS"| Nginx
-    Nginx -->|"/voice/*"| VoiceService
+    Nginx -->|"/voice/ (HTML+assets)"| WebUI
+    Nginx -->|"/voice/converse (WS+API)"| VoiceService
 
     WS --> Orch
     REST --> STT
@@ -46,7 +50,6 @@ graph TB
     Orch -->|"stream tokens"| OnyxAPI
     Orch --> TTS
     OnyxAPI --> Ollama
-    FE -->|"static assets"| Nginx
 ```
 
 ---
@@ -105,39 +108,29 @@ sequenceDiagram
 
     O->>C: { "type": "done" }
 ```
-
-### Key Architectural Decisions
-
-- **WebSocket over SSE** — Native binary frames avoid base64 overhead for audio. Bidirectional for Pi agent streaming.
-- **Server-side orchestration** — The STT → LLM → TTS pipeline runs on the server so every client shares the same API. No client reimplements orchestration logic.
-- **Concurrent TTS** — Sentence boundary detection runs during LLM streaming. Each sentence is synthesized in a background worker via `asyncio.Queue` while the LLM continues generating. TTS runs in `asyncio.to_thread()` to avoid blocking the event loop.
-- **Cookie-forwarded auth** — The browser sends cookies on the WebSocket handshake. The voice service extracts the `Cookie` header and forwards it to the Onyx API, so no separate auth system is needed.
-- **Frontend/backend separation** — Per the project's design constraints, the frontend (Vite + TypeScript) and backend (FastAPI) are decoupled. The frontend builds to static assets at container build time via a multi-stage Dockerfile.
-
 ---
 
 ## Directory Structure
 
 ```
 services/voice/
-├── Dockerfile           Multi-stage build (Node.js frontend + Python backend)
-├── .gitignore           Ignores frontend/node_modules/ and static/
-├── backend/             FastAPI application and pipeline logic
-│   ├── main.py          App entry, static file serving, REST endpoints
-│   ├── converse.py      WebSocket endpoint, message dispatch, TTS worker
-│   ├── orchestrator.py  Onyx API client, NDJSON parsing, sentence detection
-│   ├── transcribe.py    Whisper STT (faster-whisper, CUDA, float16)
-│   ├── synthesize.py    Piper TTS (ONNX Runtime, WAV output)
-│   └── requirements.txt Python dependencies
-├── frontend/            Vite + TypeScript source
-│   ├── src/
-│   │   └── app.ts       WebSocket client, audio playback, recording, UI
-│   ├── index.html       HTML entry point
-│   ├── style.css        Dark theme styles
-│   ├── package.json     Vite + TypeScript dev dependencies
-│   ├── tsconfig.json    Strict TS config (noEmit, type checking only)
-│   └── vite.config.ts   Builds to ../static/, base path /voice/static/
-└── static/              Vite build output (generated, gitignored)
-    ├── index.html       Built HTML served at /voice/
-    └── assets/          Hashed JS and CSS bundles
+├── Dockerfile           Python-only build (CUDA runtime, no Node.js)
+├── .gitignore
+└── src/                 FastAPI application and pipeline logic
+    ├── main.py          App entry, health + REST endpoints (API-only)
+    ├── converse.py      WebSocket endpoint, message dispatch, TTS worker
+    ├── orchestrator.py  Onyx API client, NDJSON parsing, sentence detection
+    ├── transcribe.py    Whisper STT (faster-whisper, CUDA, float16)
+    ├── synthesize.py    Piper TTS (ONNX Runtime, WAV output)
+    └── requirements.txt Python dependencies
 ```
+
+The companion frontend lives in [`services/webui`](../webui/) — see its README for structure and design.
+
+## Key Design Decisions
+
+- **WebSocket over SSE** — Native binary frames avoid base64 overhead for audio. Bidirectional for Pi agent streaming.
+- **Server-side orchestration** — The STT → LLM → TTS pipeline runs on the server so every client shares the same API. No client reimplements orchestration logic.
+- **Concurrent TTS** — Sentence boundary detection runs during LLM streaming. Each sentence is synthesized in a background worker via `asyncio.Queue` while the LLM continues generating. TTS runs in `asyncio.to_thread()` to avoid blocking the event loop.
+- **API key auth** — The voice service authenticates to the Onyx API using a service-level API key (`ONYX_API_KEY`), so any device on the LAN can use the voice UI without logging into Onyx.
+- **Frontend/backend separation** — Per the project's design constraints, the frontend (Vite + TypeScript) lives in its own container (`services/webui`) and the voice service exposes only an API surface. No UI concerns in this service.

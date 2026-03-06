@@ -59,8 +59,11 @@ bash scripts/init.sh
 docker compose up -d
 
 # 3. Open the UI
-# Local:   http://localhost
-# Network: http://<your-host-ip>
+# Local:        http://localhost
+# Network:      http://$HOSTNAME.local      (mDNS — works on any LAN device)
+# Voice UI:     http://$HOSTNAME.local/voice/
+echo "Chat:  http://$HOSTNAME.local"
+echo "Voice: http://$HOSTNAME.local/voice/"
 ```
 
 On first load:
@@ -68,6 +71,22 @@ On first load:
 2. **Skip connector setup** — add file sources later
 3. **Verify the LLM** — Admin → LLM Providers → confirm `ollama / llama4:scout`
 4. **Start chatting** — first response is slower while the model loads into VRAM
+
+### Voice Assistant setup (one-time)
+
+The voice assistant at `http://$HOSTNAME.local/voice/` uses an Onyx API key so any device on your network can use it without logging into Onyx.
+
+1. **Create an API key** — Onyx UI → Settings → API Keys → New API Key → Role: **Basic**
+2. **Add it to `.env`:**
+   ```
+   ONYX_API_KEY=your-key-here
+   ```
+3. **Rebuild the voice service:**
+   ```bash
+   docker compose up -d --build voice-service
+   ```
+
+The key persists across rebuilds. It is only lost if you run `docker compose down -v` (full teardown with volume wipe).
 
 ---
 

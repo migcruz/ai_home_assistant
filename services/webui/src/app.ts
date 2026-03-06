@@ -1,4 +1,4 @@
-import '../style.css';
+import './style.css';
 
 // ── State ────────────────────────────────────────────────────────────────────
 let ws: WebSocket | null = null;

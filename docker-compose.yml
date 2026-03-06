@@ -215,6 +215,17 @@ services:
     ports:
       - "3000:3000"
 
+  # ── Voice Web UI (static frontend) ─────────────────────────────────────────
+  webui:
+    build: ./services/webui
+    container_name: onyx-webui
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/voice/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   nginx:
     image: nginx:1.25.5-alpine
     container_name: onyx-nginx
@@ -226,9 +237,10 @@ services:
     depends_on:
       - web_server
       - api_server
+      - webui
       - voice-service
 
-  # ── Voice Service (STT + TTS) ───────────────────────────────────────────────
+  # ── Voice Service (STT + TTS + API) ─────────────────────────────────────────
   voice-service:
     build: ./services/voice
     container_name: onyx-voice
@@ -239,6 +251,7 @@ services:
       - WHISPER_MODEL=medium
       - PIPER_VOICE=en_US-lessac-medium
       - CACHE_DIR=/app/.cache
+      - ONYX_API_KEY=${ONYX_API_KEY}
     volumes:
       - voice_model_cache:/app/.cache
     healthcheck:

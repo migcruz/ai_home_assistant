@@ -26,7 +26,8 @@ graph TB
         OnyxWeb["Onyx Web\nNext.js UI"]
         OnyxAPI["Onyx API\nFastAPI + RAG"]
         OnyxBG["Onyx Background\nIndexing Workers"]
-        VoiceSvc["Voice Service\nSTT · TTS · Audio"]
+        WebUISvc["Web UI Service\nVite · nginx:alpine"]
+        VoiceSvc["Voice Service\nSTT · TTS · API"]
         HASvc["HA Bridge\nHome Assistant API"]
     end
 
@@ -60,7 +61,8 @@ graph TB
 
     Nginx --> OnyxWeb
     Nginx -->|/api/*| OnyxAPI
-    Nginx -->|/voice/*| VoiceSvc
+    Nginx -->|"/voice/ (HTML+assets)"| WebUISvc
+    Nginx -->|"/voice/* (API+WS)"| VoiceSvc
 
     OnyxAPI --> PG
     OnyxAPI --> Vespa
@@ -95,14 +97,15 @@ graph TB
 | Onyx Web, API, Background, Model Servers | Existing (Onyx) | RAG, chat, indexing |
 | Ollama | Existing | LLM inference |
 | PostgreSQL, Vespa, Redis, Nginx | Existing | Infra |
-| **Voice Service** | **New — custom** | STT (Whisper), TTS (Piper), WebSocket relay for Pi |
+| **Web UI Service** | **New — custom** | Serves voice assistant frontend (Vite + TypeScript, nginx:alpine) |
+| **Voice Service** | **New — custom** | STT (Whisper), TTS (Piper), WebSocket orchestration, REST API |
 | **HA Bridge** | **New — custom** | Translates assistant intent → Home Assistant REST API calls |
 
 ---
 
 ## 1.3 Design Constraints
 
-1. **Frontend/Backend Separation** — User-facing services must separate frontend (UI) and backend (API/logic) into distinct layers. Frontend code lives in its own directory with its own build toolchain (e.g., `frontend/` with Vite + TypeScript), and backend code is never coupled to a specific UI. This promotes modularity: any client (web, mobile, Pi agent) can consume the same backend API without reimplementing server-side logic. Build artifacts (HTML, JS, CSS) are generated at container build time and served as static assets.
+1. **Frontend/Backend Separation** — User-facing services must separate frontend (UI) and backend (API/logic) into distinct layers. Frontend code lives in its own directory with its own build toolchain (e.g., `src/` with Vite + TypeScript), and backend code is never coupled to a specific UI. This promotes modularity: any client (web, mobile, Pi agent) can consume the same backend API without reimplementing server-side logic. Build artifacts (HTML, JS, CSS) are generated at container build time and served as static assets. For the voice assistant this means `services/webui` (nginx + Vite) and `services/voice` (FastAPI) are separate containers.
 
 ---
 
@@ -137,7 +140,7 @@ Provided by Onyx out of the box (unmodified — the Onyx web container is a pre-
 
 ### 2.1a Voice Chat UI (`/voice/`)
 
-A custom standalone single-page app served by the Voice Service at `http://<host>/voice/`.
+A custom standalone single-page app served by the Web UI Service at `http://<host>/voice/`. Static assets (HTML, JS, CSS) are built by Vite at container build time and served by nginx:alpine. The page connects to the Voice Service API/WebSocket at runtime.
 
 ```
 ┌───────────────────────────────────────────────┐
@@ -164,7 +167,7 @@ A custom standalone single-page app served by the Voice Service at `http://<host
 - Audio visualizer bar while recording
 - Text input fallback — can type instead of speak
 - "← Chat" link returns to the main Onyx UI
-- Reuses the active Onyx login session (`credentials: include`) — user must be logged into Onyx first
+- No Onyx login required — the Voice Service authenticates to the Onyx API using a service-level API key (`ONYX_API_KEY`); any device on the LAN can use the voice UI directly
 - TTS plays back sentence-by-sentence for low latency; uses a persistent Web Audio `AudioContext` (zero-gain oscillator) to keep the OS audio device warm and prevent the first syllable from being clipped
 
 ### 2.2 Mobile PWA UI
@@ -203,23 +206,28 @@ Mobile-optimized single-column layout:
 #### Mode A — Browser Voice Chat (`/voice/`)
 
 ```
-User navigates to http://<host>/voice/ (must be logged into Onyx at http://<host>/)
-    → Page creates a new Onyx chat session on load
+User navigates to http://<host>/voice/ (no login required — service API key handles auth)
+    → Page opens WS /voice/converse (persistent WebSocket to Voice Service)
+    → Voice Service creates an Onyx chat session server-side
     → User clicks 🎤
         → Web Audio AudioContext created (keeps audio device warm)
         → Browser requests mic permission
         → UI shows "Listening…" + audio visualizer
-        → MediaRecorder captures audio (webm/ogg)
-    → User clicks 🎤 again to stop (or silence timeout — future)
-        → Audio blob POSTed to POST /voice/transcribe
-        → Whisper transcribes on GPU → { "text": "..." }
+        → MediaRecorder captures audio (webm/opus chunks)
+    → User clicks 🎤 again to stop
+        → Binary audio chunks sent over WebSocket
+        → Client sends { "type": "end_audio" }
+        → Voice Service runs Whisper STT on GPU
+        → Server sends { "type": "transcript", "text": "..." }
         → Transcript shown as user message bubble
-    → Text sent to Onyx API POST /api/chat/send-message (SSE/NDJSON stream)
-        → Streaming response tokens rendered in AI bubble in real time
-    → On stream complete → full response text POSTed sentence-by-sentence to POST /voice/synthesize
-        → Piper TTS returns WAV audio per sentence
-        → Browser plays each WAV sequentially via Audio element
-        → AudioContext prevents OS audio device warmup clipping on first sentence
+    → Voice Service streams to Onyx API (SSE/NDJSON)
+        → For each LLM token: server sends { "type": "token", "content": "..." }
+        → Tokens rendered in AI bubble in real time
+        → For each detected sentence: server runs Piper TTS concurrently
+        → Server sends binary WAV frame per sentence
+        → Browser plays WAV frames sequentially via Web Audio API
+        → AudioContext keeps audio device warm — prevents first-syllable clipping
+    → Server sends { "type": "done" } — turn complete
 ```
 
 #### Mode B — PWA Microphone (Mobile) *(planned)*
@@ -349,13 +357,14 @@ The Voice Service is a new lightweight service added to the Docker stack.
 
 ### 5.1 Responsibilities
 
-- Accept audio from browser/PWA clients via HTTP POST
-- Accept audio streams from Raspberry Pi via WebSocket
+- Accept audio and text from any client over a persistent WebSocket
+- Accept audio streams from Raspberry Pi via the same WebSocket protocol
 - Run Whisper (STT) to transcribe audio → text
-- Forward text to Onyx API
-- Receive text response from Onyx API
-- Run Piper TTS to synthesize speech → audio
-- Return audio to client (HTTP response or WebSocket stream)
+- Create and maintain Onyx chat sessions server-side (authenticated by API key)
+- Stream LLM responses from Onyx API, forwarding tokens to the client in real time
+- Detect sentence boundaries during LLM streaming; run Piper TTS concurrently
+- Send synthesized WAV audio frames back to the client over the WebSocket
+- Expose REST endpoints for direct STT/TTS access by other services
 
 ### 5.2 Interfaces
 
@@ -363,16 +372,16 @@ The Voice Service is a new lightweight service added to the Docker stack.
 
 | Interface | Protocol | Used by |
 |---|---|---|
-| `GET /voice/` | HTTP | Browser — serves standalone voice chat UI |
+| `WS /voice/converse` | WebSocket | Browser, PWA, Pi — full-duplex voice chat (audio in, tokens + WAV out) |
 | `GET /voice/health` | HTTP | Smoke tests, healthcheck |
-| `POST /voice/transcribe` | HTTP multipart | Voice UI — uploads recorded audio, returns transcript |
-| `POST /voice/synthesize` | HTTP JSON | Voice UI — sends text, returns audio/wav |
+| `POST /voice/transcribe` | HTTP multipart | Direct STT access — uploads audio, returns transcript |
+| `POST /voice/synthesize` | HTTP JSON | Direct TTS access — sends text, returns audio/wav |
+
+**Note:** The voice chat HTML and JS/CSS assets are served by `services/webui` (nginx:alpine), not this service. This service is API-only.
 
 **Planned (Phase 6 — Pi agent):**
 
-| Interface | Protocol | Used by |
-|---|---|---|
-| `WS /voice/stream` | WebSocket | Raspberry Pi — bidirectional audio stream (mic in, TTS out) |
+The Pi agent uses the existing `WS /voice/converse` protocol — no new endpoint needed. The wire protocol already supports binary audio streaming and WAV response frames.
 
 ### 5.3 Raspberry Pi Agent
 
@@ -416,7 +425,7 @@ The LLM is prompted with available Home Assistant entities and their capabilitie
 | 1 | Onyx + Ollama + infra | **Done** |
 | 2 | Static LAN IP, `WEB_DOMAIN` update, homelab migration | — |
 | 3 | Host filesystem mounts, Onyx file connectors configured | — |
-| 4 | Voice Service container (Whisper + Piper); standalone `/voice/` UI | **In progress** — text chat + TTS working; STT UI flow pending |
+| 4 | Voice Service (Whisper + Piper + WS orchestration); Web UI Service (Vite + nginx); standalone `/voice/` UI | **In Progress** — text chat + TTS working; STT UI flow pending |
 | 5 | HA Bridge container, Home Assistant connection | — |
 | 6 | Raspberry Pi agent deployed, `WS /voice/stream` endpoint added | — |
 | 7 | Auth system expanded with household/child accounts and profiles | — |

@@ -1,10 +1,7 @@
-import os
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from converse import router as converse_router
@@ -23,8 +20,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.include_router(converse_router)
 
-STATIC_DIR = Path(__file__).parent / "static"
-
 
 class SynthesizeRequest(BaseModel):
     text: str
@@ -33,11 +28,6 @@ class SynthesizeRequest(BaseModel):
 @app.get("/voice/health")
 def health():
     return {"status": "ok"}
-
-
-@app.get("/voice/")
-def index():
-    return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.post("/voice/transcribe")
@@ -61,6 +51,3 @@ def synthesize_text(req: SynthesizeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return Response(content=wav_bytes, media_type="audio/wav")
-
-
-app.mount("/voice/static", StaticFiles(directory=STATIC_DIR), name="static")

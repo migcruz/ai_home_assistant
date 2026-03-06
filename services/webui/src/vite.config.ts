@@ -4,7 +4,7 @@ export default defineConfig({
   root: '.',
   base: '/voice/static/',
   build: {
-    outDir: '../static',
+    outDir: 'dist',
     emptyOutDir: true,
   },
 });

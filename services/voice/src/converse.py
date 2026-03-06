@@ -41,7 +41,6 @@ MAX_AUDIO_BYTES = 10 * 1024 * 1024  # 10 MB — ~10 min of opus audio
 async def converse(ws: WebSocket) -> None:
     await ws.accept()
 
-    cookies = ws.headers.get("cookie", "")
     chat_session_id: int | None = None
     tts_enabled = True
     audio_buffer = bytearray()
@@ -116,16 +115,14 @@ async def converse(ws: WebSocket) -> None:
                 # ── Run the pipeline ──────────────────────────────────────
                 if chat_session_id is None:
                     try:
-                        chat_session_id = await create_chat_session(
-                            client, cookies,
-                        )
+                        chat_session_id = await create_chat_session(client)
                     except Exception as exc:
                         logger.exception("Session creation failed")
                         await _send_error(ws, f"Chat session failed: {exc}")
                         continue
 
                 await _run_pipeline(
-                    ws, client, cookies,
+                    ws, client,
                     chat_session_id, user_text, tts_enabled,
                 )
 
@@ -138,7 +135,6 @@ async def converse(ws: WebSocket) -> None:
 async def _run_pipeline(
     ws: WebSocket,
     client: httpx.AsyncClient,
-    cookies: str,
     chat_session_id: int,
     user_text: str,
     tts_enabled: bool,
@@ -174,7 +170,7 @@ async def _run_pipeline(
                 await tts_queue.put((text, idx))
 
         await stream_chat_response(
-            client, cookies, chat_session_id, user_text,
+            client, chat_session_id, user_text,
             on_token, on_sentence,
         )
     except Exception as exc:

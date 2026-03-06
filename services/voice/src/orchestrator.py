@@ -7,6 +7,7 @@ wire protocol defined in converse.py.
 
 import asyncio
 import json
+import os
 import re
 from typing import Callable, Awaitable
 
@@ -16,10 +17,16 @@ from transcribe import transcribe
 from synthesize import synthesize
 
 ONYX_BASE = "http://api_server:8080"
+_ONYX_API_KEY = os.getenv("ONYX_API_KEY", "")
 
 # Sentence boundary: split after .!? followed by whitespace then an uppercase
 # letter or quote.  Avoids false splits on abbreviations like "Dr. Smith".
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'])")
+
+
+def _auth_headers() -> dict[str, str]:
+    """Return Authorization header using the configured Onyx API key."""
+    return {"Authorization": f"Bearer {_ONYX_API_KEY}"}
 
 
 def extract_token(line: str) -> str | None:
@@ -56,14 +63,13 @@ def extract_sentences(text: str, is_end: bool = False) -> tuple[list[str], str]:
 
 async def create_chat_session(
     client: httpx.AsyncClient,
-    cookies: str,
     persona_id: int = 0,
 ) -> int:
-    """Create an Onyx chat session, forwarding the browser's cookies."""
+    """Create an Onyx chat session using the service API key."""
     resp = await client.post(
         f"{ONYX_BASE}/chat/create-chat-session",
         json={"persona_id": persona_id},
-        headers={"Cookie": cookies},
+        headers=_auth_headers(),
     )
     resp.raise_for_status()
     return resp.json()["chat_session_id"]
@@ -71,7 +77,6 @@ async def create_chat_session(
 
 async def stream_chat_response(
     client: httpx.AsyncClient,
-    cookies: str,
     chat_session_id: int,
     message: str,
     on_token: Callable[[str], Awaitable[None]],
@@ -97,7 +102,7 @@ async def stream_chat_response(
             "retrieval_options": {"run_search": "auto", "real_time": True},
             "stream_response": True,
         },
-        headers={"Cookie": cookies},
+        headers=_auth_headers(),
         timeout=300.0,
     ) as response:
         response.raise_for_status()

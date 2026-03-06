@@ -26,7 +26,8 @@
 
 | Service | Technology | Rationale |
 |---|---|---|
-| **Voice Service** | Python + FastAPI | Thin wrapper around Whisper + Piper, serves HTTP + WebSocket |
+| **Web UI Service** | Vite + TypeScript + nginx:alpine | Static frontend for voice assistant; built at image build time, served with long-lived cache headers |
+| **Voice Service** | Python + FastAPI | WebSocket orchestrator for STT → LLM → TTS pipeline; REST endpoints for direct STT/TTS access |
 | **STT** | OpenAI Whisper (local) | Best local accuracy; already used by Onyx model server base image |
 | **TTS** | Piper TTS | Fast, lightweight, fully local, good voice quality |
 | **HA Bridge** | Python + FastAPI | Thin proxy between Onyx and Home Assistant REST API |
@@ -63,11 +64,28 @@ soundfile==0.12.1
 numpy==1.26.4
 ```
 
+**Environment variables:**
+```
+ONYX_API_KEY=<onyx-api-key>   # basic-role key; authenticates voice service to Onyx API
+WHISPER_MODEL=medium
+PIPER_VOICE=en_US-lessac-medium
+CACHE_DIR=/app/.cache
+```
+
 **Endpoints (implemented — Phase 4):**
 
 ```
-GET  /voice/
-  Response: text/html — voice chat UI (index.html)
+WS  /voice/converse
+  Bidirectional WebSocket — full-duplex voice chat protocol:
+  → Client sends: TEXT  { "type": "config", "tts": true }       optional on connect
+  → Client sends: TEXT  { "type": "text_input", "message": "…" } text query
+  → Client sends: BINARY raw audio chunks (webm/opus)            voice query
+  → Client sends: TEXT  { "type": "end_audio" }                  signals recording done
+  ← Server sends: TEXT  { "type": "transcript", "text": "…" }   STT result
+  ← Server sends: TEXT  { "type": "token", "content": "…" }     LLM streaming token
+  ← Server sends: BINARY WAV audio bytes                         TTS per sentence
+  ← Server sends: TEXT  { "type": "done" }                       turn complete
+  ← Server sends: TEXT  { "type": "error", "detail": "…" }      on failure
 
 GET  /voice/health
   Response: { "status": "ok" }
@@ -81,16 +99,11 @@ POST /voice/synthesize
   Response: audio/wav binary
 ```
 
-**Endpoints (planned — Phase 6, Pi agent):**
+**Note:** The voice chat HTML/JS/CSS is served by `services/webui` (nginx:alpine), not this service.
 
-```
-WS /voice/stream
-  Bidirectional WebSocket:
-  → Client sends: binary audio frames (16kHz mono PCM)
-  → Client sends: JSON { "event": "end_of_speech" }
-  ← Server sends: JSON { "transcript": "..." }
-  ← Server sends: binary audio frames (TTS response)
-```
+**Endpoints (Phase 6 — Pi agent):**
+
+The Pi agent uses the existing `WS /voice/converse` protocol — no new endpoint needed. The wire protocol already supports binary audio in and WAV frames out.
 
 **Whisper configuration:**
 ```python
@@ -102,30 +115,48 @@ language = "en"              # auto-detect if multilingual needed
 
 **Piper configuration:**
 - Default voice: `en_US-lessac-medium`
-- Voice files downloaded at container startup if not cached
+- Voice model files (`.onnx` + `.onnx.json`) downloaded at **image build time** and baked into the image — no startup download delay
 - Runs on CPU (GPU not needed for TTS at this scale)
 
 **Nginx routing additions:**
 ```nginx
-# Lazy DNS resolution (resolver variable) so nginx starts even if voice-service
-# container is not yet running — Docker's embedded DNS is 127.0.0.11
-location /voice/ {
-    resolver 127.0.0.11 valid=10s;
-    set $voice_upstream "voice-service:8765";
-    proxy_pass http://$voice_upstream;   # no path suffix — nginx passes full URI as-is
+upstream webui {
+    server webui:80;
+}
+
+# Voice UI — HTML page (exact match, highest nginx priority)
+location = /voice/ {
+    proxy_pass http://webui/voice/;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
+}
+
+# Voice UI — hashed JS/CSS assets (1-year immutable cache via webui nginx)
+location /voice/static/ {
+    proxy_pass http://webui/voice/static/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+}
+
+# Voice API + WebSocket
+# Lazy DNS resolution so nginx starts even if voice-service isn't up yet
+location /voice/ {
+    resolver 127.0.0.11 valid=10s;
+    set $voice_upstream "voice-service:8765";
+    proxy_pass http://$voice_upstream;   # no path suffix — nginx passes full URI unchanged
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
     proxy_buffering off;
-    proxy_read_timeout 120s;
-    proxy_send_timeout 120s;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
 }
 ```
 
-> **Note:** When `proxy_pass` uses a variable, nginx passes the full original request URI
-> unchanged (unlike a literal upstream where path rewriting occurs). Appending a path suffix
-> to the variable proxy_pass URL causes double-path bugs (e.g. `/voice//voice/transcribe`).
-> Leave the proxy_pass URL without a trailing path.
+> **Note:** nginx location priority — exact (`= /voice/`) > longest prefix (`/voice/static/`) > general prefix (`/voice/`). This ensures HTML and assets route to `webui` while API and WebSocket traffic routes to `voice-service`. When `proxy_pass` uses a variable, nginx passes the full original URI unchanged — do not append a path suffix to avoid double-path bugs.
 
 ---
 
@@ -202,7 +233,7 @@ IDLE
 
 WAKE_WORD_DETECTED
   → play acknowledgement chime
-  → open WebSocket to wss://<host-ip>/voice/stream
+  → open WebSocket to wss://<host-ip>/voice/converse
   → transition to RECORDING
 
 RECORDING
@@ -313,11 +344,21 @@ Configure connectors in Onyx admin UI pointing to `/mnt/indexed/`.
 
 ---
 
-### Phase 4 — Voice Service *(implemented)*
+### Phase 4 — Voice Service + Web UI Service *(implemented)*
 
 Add to `docker-compose.yml`:
 
 ```yaml
+webui:
+  build: ./services/webui
+  container_name: onyx-webui
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost/voice/"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+
 voice-service:
   build: ./services/voice
   container_name: onyx-voice
@@ -328,6 +369,7 @@ voice-service:
     - WHISPER_MODEL=medium
     - PIPER_VOICE=en_US-lessac-medium
     - CACHE_DIR=/app/.cache
+    - ONYX_API_KEY=${ONYX_API_KEY}
   volumes:
     - voice_model_cache:/app/.cache
   # No exposed ports — internal only, accessed via nginx proxy
@@ -339,22 +381,23 @@ voice-service:
     start_period: 60s
 ```
 
-Also add `voice_model_cache:` to the top-level `volumes:` section.
+Also add `voice_model_cache:` to the top-level `volumes:` section, and add `webui` and `voice-service` to nginx's `depends_on`.
 
-Add to `nginx/nginx.conf` (see lazy DNS resolver note in §2.1):
-```nginx
-location /voice/ {
-    resolver 127.0.0.11 valid=10s;
-    set $voice_upstream "voice-service:8765";
-    proxy_pass http://$voice_upstream;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_buffering off;
-    proxy_read_timeout 120s;
-    proxy_send_timeout 120s;
-}
+Add to `.env`:
 ```
+ONYX_API_KEY=<basic-role key from Onyx UI → Settings → API Keys>
+```
+
+Add to `nginx/nginx.conf` (see routing note in §2.1):
+```nginx
+upstream webui { server webui:80; }
+
+location = /voice/      { proxy_pass http://webui/voice/; ... }
+location /voice/static/ { proxy_pass http://webui/voice/static/; ... }
+location /voice/        { resolver 127.0.0.11 valid=10s; set $u "voice-service:8765"; proxy_pass http://$u; ... }
+```
+
+See `nginx/nginx.conf` for the full block (WebSocket upgrade headers, timeouts).
 
 ---
 
@@ -397,7 +440,7 @@ sudo systemctl enable --now pi-agent
 ```yaml
 server:
   host: 192.168.1.x      # assistant host static IP
-  ws_path: /voice/stream
+  ws_path: /voice/converse
 
 audio:
   sample_rate: 16000
@@ -425,9 +468,9 @@ Each phase is self-contained and can be stopped/started independently.
 |---|---|---|---|
 | **2 — Homelab** | Set static IP, update `WEB_DOMAIN`, `docker compose up` on rack | `docker-compose.yml` env update | — |
 | **3 — File Indexing** | Add volume mounts, configure connectors in Onyx UI | `docker-compose.yml` update | — |
-| **4 — Voice** | Build voice service, add Nginx route, standalone voice chat UI | `services/voice/`, Nginx update | **In progress** — text chat + TTS working; STT UI flow pending |
+| **4 — Voice** | Voice Service (WS orchestration + STT/TTS); Web UI Service (Vite + nginx); standalone `/voice/` UI; ONYX_API_KEY auth | `services/voice/`, `services/webui/`, nginx update | **In Progress** |
 | **5 — Smart Home** | Build HA Bridge, extend Onyx system prompt, add HA env vars | `services/ha-bridge/` | — |
-| **6 — Pi Agent** | Build Pi agent, deploy to Pi, add `WS /voice/stream` endpoint | `pi-agent/` | — |
+| **6 — Pi Agent** | Build Pi agent, deploy to Pi — uses existing `WS /voice/converse` | `pi-agent/` | — |
 | **7 — Multi-user** | Add DB tables, build admin UI for user/profile management | DB migration, UI additions | — |
 | **8 — Phone Upload** | Add upload endpoint, connector for uploaded files | `services/voice/` or new service | — |
 | **9 — Network Shares** | Mount SMB/NFS, add connectors in Onyx | `docker-compose.yml` update | — |

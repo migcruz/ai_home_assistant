@@ -1,2 +1,1 @@
-frontend/node_modules/
-static/
+# No generated outputs — frontend and static assets live in services/webui

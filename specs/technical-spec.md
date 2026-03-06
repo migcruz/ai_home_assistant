@@ -19,7 +19,7 @@
 | Database | PostgreSQL | `15.2-alpine` |
 | Cache / Queue | Redis | `7.4-alpine` |
 | Web UI | Onyx Next.js | `onyxdotapp/onyx-web-server:latest` |
-| Reverse Proxy | Nginx | `1.25.5-alpine` |
+| Reverse Proxy | Nginx | `1.25.5-alpine` (custom build — adds openssl, self-signed TLS entrypoint) |
 | GPU Runtime | NVIDIA Container Toolkit | host-installed |
 
 ### 1.2 New Services
@@ -388,7 +388,7 @@ Add to `.env`:
 ONYX_API_KEY=<basic-role key from Onyx UI → Settings → API Keys>
 ```
 
-Add to `nginx/nginx.conf` (see routing note in §2.1):
+Add to `services/nginx/nginx.conf` (see routing note in §2.1):
 ```nginx
 upstream webui { server webui:80; }
 
@@ -397,7 +397,7 @@ location /voice/static/ { proxy_pass http://webui/voice/static/; ... }
 location /voice/        { resolver 127.0.0.11 valid=10s; set $u "voice-service:8765"; proxy_pass http://$u; ... }
 ```
 
-See `nginx/nginx.conf` for the full block (WebSocket upgrade headers, timeouts).
+See `services/nginx/nginx.conf` for the full block (WebSocket upgrade headers, timeouts).
 
 ---
 
@@ -468,7 +468,7 @@ Each phase is self-contained and can be stopped/started independently.
 |---|---|---|---|
 | **2 — Homelab** | Set static IP, update `WEB_DOMAIN`, `docker compose up` on rack | `docker-compose.yml` env update | — |
 | **3 — File Indexing** | Add volume mounts, configure connectors in Onyx UI | `docker-compose.yml` update | — |
-| **4 — Voice** | Voice Service (WS orchestration + STT/TTS); Web UI Service (Vite + nginx); standalone `/voice/` UI; ONYX_API_KEY auth | `services/voice/`, `services/webui/`, nginx update | **In Progress** |
+| **4 — Voice** | Voice Service (WS orchestration + STT/TTS); Web UI Service (Vite + nginx); standalone `/voice/` UI; ONYX_API_KEY auth; HTTPS (self-signed TLS, cert auto-generated in nginx container) | `services/voice/`, `services/webui/`, `services/nginx/` | **Done** |
 | **5 — Smart Home** | Build HA Bridge, extend Onyx system prompt, add HA env vars | `services/ha-bridge/` | — |
 | **6 — Pi Agent** | Build Pi agent, deploy to Pi — uses existing `WS /voice/converse` | `pi-agent/` | — |
 | **7 — Multi-user** | Add DB tables, build admin UI for user/profile management | DB migration, UI additions | — |
@@ -484,9 +484,9 @@ Each phase is self-contained and can be stopped/started independently.
 | Area | Approach |
 |---|---|
 | **Secrets** | All credentials in `.env` (git-ignored). HA token stored server-side only, never exposed to client. |
-| **Network exposure** | Only port 80 exposed to LAN. All internal service ports are container-internal. |
+| **Network exposure** | Ports 80 (HTTP→HTTPS redirect) and 443 (HTTPS/TLS) exposed to LAN. All internal service ports are container-internal. |
 | **Pi WebSocket** | Authenticated via a shared pre-configured token in `config.yaml`. Rotate on compromise. |
 | **File mounts** | All host mounts are `:ro` (read-only). Containers cannot write to host filesystem. |
 | **Audio privacy** | Audio streams processed entirely on LAN. No audio sent outside the network. |
 | **Parental controls** | Enforced server-side — cannot be bypassed by the client. Time restrictions enforced at API layer. |
-| **Future: TLS** | Add Nginx SSL (Let's Encrypt or self-signed) when exposing beyond LAN (Tailscale handles this for remote access). |
+| **TLS** | Self-signed cert auto-generated inside the nginx container on first start, stored in a named Docker volume (`nginx_certs`). Required for `navigator.mediaDevices` mic access (browsers block on plain HTTP). Set `CERT_HOSTNAME` in `.env` (default: `vulcan.local`). |

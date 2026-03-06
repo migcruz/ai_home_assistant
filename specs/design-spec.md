@@ -15,49 +15,49 @@ graph TB
     subgraph Clients["Client Layer"]
         Browser["Desktop Browser"]
         PWA["Mobile PWA"]
-        Pi["Raspberry Pi\nAmbient Mic + Speaker"]
+        Pi["Raspberry Pi Ambient Mic + Speaker"]
     end
 
     subgraph Gateway["Gateway"]
-        Nginx["Nginx\nReverse Proxy :80"]
+        Nginx["Nginx Reverse Proxy :80/:443"]
     end
 
     subgraph Core["Core Services (Docker — Host Machine)"]
-        OnyxWeb["Onyx Web\nNext.js UI"]
-        OnyxAPI["Onyx API\nFastAPI + RAG"]
-        OnyxBG["Onyx Background\nIndexing Workers"]
-        WebUISvc["Web UI Service\nVite · nginx:alpine"]
-        VoiceSvc["Voice Service\nSTT · TTS · API"]
-        HASvc["HA Bridge\nHome Assistant API"]
+        OnyxWeb["Onyx Web Next.js UI"]
+        OnyxAPI["Onyx API FastAPI + RAG"]
+        OnyxBG["Onyx Background Indexing Workers"]
+        WebUISvc["Web UI Service Vite · nginx:alpine"]
+        VoiceSvc["Voice Service STT · TTS · API"]
+        HASvc["HA Bridge Home Assistant API"]
     end
 
     subgraph AI["AI Layer"]
-        Ollama["Ollama\nLlama 4 Scout"]
-        IMS["Inference Model Server\nEmbeddings"]
-        IDXMS["Indexing Model Server\nEmbeddings"]
+        Ollama["Ollama Llama 4 Scout"]
+        IMS["Inference Model Server Embeddings"]
+        IDXMS["Indexing Model Server Embeddings"]
         GPU["RTX 5090"]
     end
 
     subgraph Data["Data Layer"]
-        PG[("PostgreSQL\nState · Files · Users")]
-        Vespa[("Vespa\nVector Index")]
-        Redis[("Redis\nTask Queue")]
+        PG[("PostgreSQL State · Files · Users")]
+        Vespa[("Vespa Vector Index")]
+        Redis[("Redis Task Queue")]
     end
 
     subgraph External["External (optional)"]
-        HA["Home Assistant\n(separate host)"]
-        SearchAPI["Web Search API\nBing · Tavily"]
+        HA["Home Assistant (separate host)"]
+        SearchAPI["Web Search API Bing · Tavily"]
     end
 
     subgraph Indexed["Indexed Sources"]
-        LocalFS["Local Filesystem\n(host mounts)"]
-        NetShare["Network Shares\nSMB · NFS"]
-        PhoneFiles["Phone File Uploads\n(via PWA)"]
+        LocalFS["Local Filesystem (host mounts)"]
+        NetShare["Network Shares SMB · NFS"]
+        PhoneFiles["Phone File Uploads (via PWA)"]
     end
 
-    Browser -->|HTTP| Nginx
-    PWA -->|HTTP| Nginx
-    Pi -->|WebSocket| Nginx
+    Browser -->|HTTPS| Nginx
+    PWA -->|HTTPS| Nginx
+    Pi -->|WSS| Nginx
 
     Nginx --> OnyxWeb
     Nginx -->|/api/*| OnyxAPI
@@ -140,7 +140,7 @@ Provided by Onyx out of the box (unmodified — the Onyx web container is a pre-
 
 ### 2.1a Voice Chat UI (`/voice/`)
 
-A custom standalone single-page app served by the Web UI Service at `http://<host>/voice/`. Static assets (HTML, JS, CSS) are built by Vite at container build time and served by nginx:alpine. The page connects to the Voice Service API/WebSocket at runtime.
+A custom standalone single-page app served by the Web UI Service at `https://<host>/voice/`. Static assets (HTML, JS, CSS) are built by Vite at container build time and served by nginx:alpine. The page connects to the Voice Service API/WebSocket at runtime.
 
 ```
 ┌───────────────────────────────────────────────┐
@@ -206,7 +206,7 @@ Mobile-optimized single-column layout:
 #### Mode A — Browser Voice Chat (`/voice/`)
 
 ```
-User navigates to http://<host>/voice/ (no login required — service API key handles auth)
+User navigates to https://<host>/voice/ (no login required — service API key handles auth)
     → Page opens WS /voice/converse (persistent WebSocket to Voice Service)
     → Voice Service creates an Onyx chat session server-side
     → User clicks 🎤
@@ -425,7 +425,7 @@ The LLM is prompted with available Home Assistant entities and their capabilitie
 | 1 | Onyx + Ollama + infra | **Done** |
 | 2 | Static LAN IP, `WEB_DOMAIN` update, homelab migration | — |
 | 3 | Host filesystem mounts, Onyx file connectors configured | — |
-| 4 | Voice Service (Whisper + Piper + WS orchestration); Web UI Service (Vite + nginx); standalone `/voice/` UI | **In Progress** — text chat + TTS working; STT UI flow pending |
+| 4 | Voice Service (Whisper + Piper + WS orchestration); Web UI Service (Vite + nginx); standalone `/voice/` UI; HTTPS (self-signed TLS via nginx container) | **Done** |
 | 5 | HA Bridge container, Home Assistant connection | — |
 | 6 | Raspberry Pi agent deployed, `WS /voice/stream` endpoint added | — |
 | 7 | Auth system expanded with household/child accounts and profiles | — |

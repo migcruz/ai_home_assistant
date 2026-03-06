@@ -134,3 +134,6 @@ The companion frontend lives in [`services/webui`](../webui/) — see its README
 - **Concurrent TTS** — Sentence boundary detection runs during LLM streaming. Each sentence is synthesized in a background worker via `asyncio.Queue` while the LLM continues generating. TTS runs in `asyncio.to_thread()` to avoid blocking the event loop.
 - **API key auth** — The voice service authenticates to the Onyx API using a service-level API key (`ONYX_API_KEY`), so any device on the LAN can use the voice UI without logging into Onyx.
 - **Frontend/backend separation** — Per the project's design constraints, the frontend (Vite + TypeScript) lives in its own container (`services/webui`) and the voice service exposes only an API surface. No UI concerns in this service.
+
+## TODO
+- Improve TTS timing. Right now audio chunks are sent only when a period is encountered. Perhaps we can send every 4-5 words? We will need to handle edge cases of responses less than that though.

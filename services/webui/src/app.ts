@@ -3,6 +3,7 @@ import './style.css';
 // ── State ────────────────────────────────────────────────────────────────────
 let ws: WebSocket | null = null;
 let mediaRecorder: MediaRecorder | null = null;
+let audioChunks: Blob[] = [];
 let isRecording = false;
 let isBusy = false;
 let currentAudio: AudioBufferSourceNode | null = null;
@@ -280,19 +281,26 @@ async function startRecording(): Promise<void> {
     : 'audio/webm';
 
   mediaRecorder = new MediaRecorder(stream, { mimeType });
+  audioChunks = [];
 
-  mediaRecorder.ondataavailable = async (e: BlobEvent) => {
-    if (e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(await e.data.arrayBuffer());
-    }
+  // Collect blobs synchronously — do NOT await here so onstop can't race ahead.
+  mediaRecorder.ondataavailable = (e: BlobEvent) => {
+    if (e.data.size > 0) audioChunks.push(e.data);
   };
 
-  mediaRecorder.onstop = () => {
+  // Send all chunks in order, then end_audio — guaranteed ordering.
+  mediaRecorder.onstop = async () => {
     stream.getTracks().forEach(t => t.stop());
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    const socket = ws;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    for (const chunk of audioChunks) {
+      socket.send(await chunk.arrayBuffer());
+    }
+    audioChunks = [];
+    if (socket.readyState === WebSocket.OPEN) {
       isBusy = true;
       micBtn.disabled = true;
-      ws.send(JSON.stringify({ type: 'end_audio' }));
+      socket.send(JSON.stringify({ type: 'end_audio' }));
       setStatus('transcribing…', '#f0a840');
     }
   };

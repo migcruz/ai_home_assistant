@@ -227,13 +227,17 @@ services:
       retries: 3
 
   nginx:
-    image: nginx:1.25.5-alpine
+    build: ./services/nginx
     container_name: onyx-nginx
     restart: unless-stopped
+    environment:
+      - CERT_HOSTNAME=${CERT_HOSTNAME:-vulcan.local}
     ports:
       - "80:80"
+      - "443:443"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./services/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_certs:/etc/nginx/certs
     depends_on:
       - web_server
       - api_server
@@ -271,3 +275,4 @@ volumes:
   background_logs:
   file-system:
   voice_model_cache:
+  nginx_certs:

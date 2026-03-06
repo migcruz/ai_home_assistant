@@ -26,7 +26,7 @@ def transcribe(audio_bytes: bytes) -> str:
     model = load_model()
 
     # Write to a temp file — faster-whisper needs a file path or numpy array
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 

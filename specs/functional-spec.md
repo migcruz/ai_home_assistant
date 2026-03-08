@@ -108,17 +108,17 @@ Voice is a first-class feature with three modes. All speech processing runs loca
 - Optimized for quick voice queries while on home WiFi
 
 #### Mode C — Ambient Always-Listening Microphone
-- A **Raspberry Pi** with a microphone array sits in the home and listens passively
-- **Wake word** (e.g. *"hey computer"*) is detected locally on the Pi using OpenWakeWord
-- On wake word detection, the Pi records the query and streams audio to the assistant server
+- A **custom embedded voice node** (Seeed XIAO ESP32S3 Sense) sits in the home and listens passively
+- **Wake word** (e.g. *"hey computer"*) is detected on-device using TensorFlow Lite Micro
+- On wake word detection, the device records the query and streams WAV audio to the assistant server over a TLS WebSocket
 - The server transcribes (Whisper) and responds via the LLM
-- The response is converted to speech (local TTS) and played back through a speaker attached to or near the Pi
+- The response is converted to speech (Piper TTS on the server) and streamed back as WAV frames; the device plays it through an onboard Class D amplifier and speaker
 - Supports natural home control: *"hey computer, turn off the bedroom lights"*
 
 **All voice modes share:**
 - Local STT (Whisper, runs on the assistant server)
-- Local TTS (Piper or Coqui, runs on the assistant server)
-- Wake word detection local to the Pi (OpenWakeWord)
+- Local TTS (Piper, runs on the assistant server)
+- Wake word detection on-device (no audio sent before wake word)
 - No audio or transcripts sent outside the LAN
 
 ---
@@ -187,7 +187,7 @@ Configured per child account by the owner:
 | **3 — File Indexing** | Local PC files indexed (docs, photos, videos — filename/metadata first). |
 | **4 — Voice A/B** | Browser and PWA microphone. Local STT + TTS on server. |
 | **5 — Smart Home** | Home Assistant + Matter integration. Chat and voice can control devices. |
-| **6 — Ambient Voice (C)** | Raspberry Pi always-listening microphone. Wake word + speaker. |
+| **6 — Ambient Voice (C)** | Embedded voice node (XIAO ESP32S3 Sense) — always-listening, wake word on-device, WAV streaming, speaker playback. |
 | **7 — Multi-user** | Household accounts, data scoping, parental controls. |
 | **8 — Phone File Sync** | PWA file upload for phone photos and documents. |
 | **9 — Network Shares** | Other PCs and NAS indexed over SMB/NFS. |

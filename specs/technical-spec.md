@@ -31,7 +31,7 @@
 | **STT** | OpenAI Whisper (local) | Best local accuracy; already used by Onyx model server base image |
 | **TTS** | Piper TTS | Fast, lightweight, fully local, good voice quality |
 | **HA Bridge** | Python + FastAPI | Thin proxy between Onyx and Home Assistant REST API |
-| **Pi Agent** | Python | Runs on Raspberry Pi; OpenWakeWord + WebSocket client |
+| **Voice Node** | Zephyr RTOS (C) | Runs on XIAO ESP32S3 Sense; TFLite Micro wake word + TLS WebSocket client |
 
 ### 1.3 Mobile PWA
 
@@ -101,9 +101,9 @@ POST /voice/synthesize
 
 **Note:** The voice chat HTML/JS/CSS is served by `services/webui` (nginx:alpine), not this service.
 
-**Endpoints (Phase 6 — Pi agent):**
+**Endpoints (Phase 6 — voice node):**
 
-The Pi agent uses the existing `WS /voice/converse` protocol — no new endpoint needed. The wire protocol already supports binary audio in and WAV frames out.
+The embedded voice node uses the existing `WS /voice/converse` protocol — no new endpoint needed. The wire protocol already supports binary audio in and WAV frames out.
 
 **Whisper configuration:**
 ```python
@@ -209,63 +209,38 @@ The Onyx system prompt is augmented with available entities and a function-calli
 
 ---
 
-### 2.3 Raspberry Pi Agent
+### 2.3 Embedded Voice Node
 
-**Hardware:** Raspberry Pi 4 (2GB+ RAM) or Pi 5
-**OS:** Raspberry Pi OS Lite (64-bit)
-**Mic:** ReSpeaker 4-mic array (USB or HAT) or similar
-**Speaker:** USB speaker or 3.5mm analog
+**Hardware:** Seeed XIAO ESP32S3 Sense + MAX98357A Class D amp + speaker (~$20 total)
+**RTOS:** Zephyr 4.3.0, AMP — two independent images (one per core)
+**Firmware:** [`embedded/voice_node/`](../embedded/voice_node/)
 
-**Software dependencies:**
-```
-openWakeWord          # wake word detection (local, lightweight)
-pyaudio               # mic capture
-websockets            # connection to Voice Service
-sounddevice           # audio playback
-numpy
-```
+| Core | Image | Role |
+|---|---|---|
+| PRO CPU — Core 0 | `procpu` | WiFi, TLS, WebSocket, I2S playback, BLE provisioning |
+| APP CPU — Core 1 | `appcpu` | PDM mic capture, TFLite Micro wake word, VAD |
 
-**Pi agent state machine:**
+**Device state machine:**
 ```
 IDLE
-  → mic always listening via OpenWakeWord
-  → CPU usage: ~5-10% on Pi 4
+  → APP CPU running TFLite Micro on PDM mic stream
+  → PRO CPU: WiFi associated, no open WebSocket
 
-WAKE_WORD_DETECTED
-  → play acknowledgement chime
-  → open WebSocket to wss://<host-ip>/voice/converse
+WAKE_WORD_DETECTED (appcpu → procpu via IPM)
+  → play acknowledgement chime via I2S
+  → open TLS WebSocket to wss://<host-ip>/voice/converse
   → transition to RECORDING
 
 RECORDING
-  → stream mic audio frames to Voice Service
-  → listen for silence (VAD) or timeout (8s)
-  → send { "event": "end_of_speech" }
+  → stream WAV audio frames to Voice Service
+  → APP CPU VAD monitors for silence → sends end-of-speech via IPM
+  → PRO CPU sends { "type": "end_audio" }
   → transition to WAITING
 
-WAITING
-  → receive transcript JSON from server (confirmation)
-  → receive TTS audio frames
-  → transition to PLAYING
-
-PLAYING
-  → play received audio through speaker
-  → on completion → transition to IDLE
-  → on error → play error chime → transition to IDLE
-```
-
-**Pi systemd service:**
-```ini
-[Unit]
-Description=Home Assistant Pi Agent
-After=network-online.target
-
-[Service]
-ExecStart=/usr/bin/python3 /home/pi/agent/main.py
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+WAITING / PLAYING
+  → receive WAV frames from server → play via MAX98357A
+  → receive { "type": "done" } → close WebSocket → IDLE
+  → on error → play error chime → IDLE
 ```
 
 ---
@@ -426,37 +401,18 @@ HA_TOKEN=
 
 ---
 
-### Phase 6 — Raspberry Pi
+### Phase 6 — Voice Node
 
-**On the Pi (one-time setup):**
+Build, flash, and deploy the embedded voice node. See [`embedded/voice_node/`](../embedded/voice_node/) for full firmware documentation, build instructions, and specs.
+
 ```bash
-git clone <repo> && cd home_ai_assistant/pi-agent
-pip install -r requirements.txt
-sudo cp pi-agent.service /etc/systemd/system/
-sudo systemctl enable --now pi-agent
+# Inside the dev container
+cd /zephyr-ws/embedded/voice_node
+make clean && make
+make flash
 ```
 
-**Pi agent config (`pi-agent/config.yaml`):**
-```yaml
-server:
-  host: 192.168.1.x      # assistant host static IP
-  ws_path: /voice/converse
-
-audio:
-  sample_rate: 16000
-  channels: 1
-  chunk_size: 1024
-  silence_threshold: 500
-  silence_timeout_ms: 1500
-
-wake_word:
-  model: hey_computer     # OpenWakeWord model
-  threshold: 0.5
-
-chime:
-  wake: sounds/wake.wav
-  error: sounds/error.wav
-```
+No server-side changes required — the voice node uses the existing `WS /voice/converse` endpoint with WAV audio format.
 
 ---
 
@@ -470,7 +426,7 @@ Each phase is self-contained and can be stopped/started independently.
 | **3 — File Indexing** | Add volume mounts, configure connectors in Onyx UI | `docker-compose.yml` update | — |
 | **4 — Voice** | Voice Service (WS orchestration + STT/TTS); Web UI Service (Vite + nginx); standalone `/voice/` UI; ONYX_API_KEY auth; HTTPS (self-signed TLS, cert auto-generated in nginx container) | `services/voice/`, `services/webui/`, `services/nginx/` | **Done** |
 | **5 — Smart Home** | Build HA Bridge, extend Onyx system prompt, add HA env vars | `services/ha-bridge/` | — |
-| **6 — Pi Agent** | Build Pi agent, deploy to Pi — uses existing `WS /voice/converse` | `pi-agent/` | — |
+| **6 — Voice Node** | Build and flash embedded voice node (XIAO ESP32S3 Sense) — uses existing `WS /voice/converse` | `embedded/voice_node/` | — |
 | **7 — Multi-user** | Add DB tables, build admin UI for user/profile management | DB migration, UI additions | — |
 | **8 — Phone Upload** | Add upload endpoint, connector for uploaded files | `services/voice/` or new service | — |
 | **9 — Network Shares** | Mount SMB/NFS, add connectors in Onyx | `docker-compose.yml` update | — |

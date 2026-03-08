@@ -4,7 +4,7 @@ BUILD   := build
 .PHONY: all clean flash menuconfig
 
 all:
-	west build -d $(BUILD) -b $(BOARD) .
+	west build --sysbuild -d $(BUILD) -b $(BOARD) procpu
 
 clean:
 	rm -rf $(BUILD)
@@ -13,4 +13,4 @@ flash:
 	west flash -d $(BUILD)
 
 menuconfig:
-	west build -d $(BUILD) -b $(BOARD) -t menuconfig .
+	west build --sysbuild -d $(BUILD) -b $(BOARD) -t menuconfig procpu

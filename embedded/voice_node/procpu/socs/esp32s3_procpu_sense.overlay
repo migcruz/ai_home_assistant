@@ -1,0 +1,4 @@
+/* Enable IPM for PRO CPU ↔ APP CPU inter-processor communication */
+&ipm0 {
+	status = "okay";
+};

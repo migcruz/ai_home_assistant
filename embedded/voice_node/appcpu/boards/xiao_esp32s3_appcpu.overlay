@@ -1,0 +1,20 @@
+/*
+ * Route APP CPU console to the same USB Serial/JTAG device as PRO CPU so
+ * both cores' output appears on the same /dev/ttyACM0. The hardware FIFO
+ * serialises concurrent writes; character-level interleaving is possible
+ * under simultaneous heavy logging but acceptable for debug.
+ */
+
+/ {
+	chosen {
+		zephyr,console = &usb_serial;
+	};
+};
+
+&usb_serial {
+	status = "okay";
+};
+
+&ipm0 {
+	status = "okay";
+};

@@ -1,0 +1,64 @@
+{
+  "name": "Zephyr Embedded",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // --privileged gives the container access to all host USB devices dynamically.
+  // Unlike --device=/dev/ttyACM0, this does NOT fail at startup if no board
+  // is plugged in. Devices appear inside the container as they are connected.
+  "runArgs": ["--privileged"],
+
+  // west-managed sources (zephyr/, modules/) live in a named volume at /zephyr-ws
+  // so they persist across container rebuilds without cluttering the host.
+  // The embedded/ folder is bind-mounted at the default /workspaces/embedded path.
+  // Two mounts:
+  //   1. Named volume at /zephyr-ws for west-managed sources (.west/, zephyr/, modules/)
+  //   2. Bind mount of embedded/ at /zephyr-ws/embedded so west sees it as a real
+  //      subdirectory (not a symlink — west resolves symlinks to their real path which
+  //      would put .west in the wrong place)
+  "mounts": [
+    "source=home-ai-zephyr-workspace,target=/zephyr-ws,type=volume",
+    "source=${localWorkspaceFolder},target=/zephyr-ws/embedded,type=bind"
+  ],
+
+  // Root the VS Code file explorer at /zephyr-ws so embedded/, zephyr/,
+  // modules/, and .west/ are all visible in the sidebar.
+  "workspaceFolder": "/zephyr-ws",
+
+  "remoteEnv": {
+    "ZEPHYR_BASE": "/zephyr-ws/zephyr"
+  },
+
+  // On first container create: initialise west (once), fetch all deps, then
+  // pull the Espressif proprietary binary blobs required by the WiFi driver.
+  // Subsequent opens skip init because .west/ already exists in the volume.
+  "postCreateCommand": "cd /zephyr-ws && ([ -d .west ] || west init -l /zephyr-ws/embedded) && west update && west blobs fetch hal_espressif",
+
+  // Make serial devices world-accessible on every container start.
+  // Arch Linux uses the uucp group (different GID than Ubuntu's dialout),
+  // so group membership alone can't solve this cross-distro.
+  "postStartCommand": "sudo chmod a+rw /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "nordic-semiconductor.nrf-devicetree",
+        "ms-vscode.vscode-serial-monitor",
+        "anthropic.claude-code"
+      ],
+      "settings": {
+        "C_Cpp.default.includePath": [
+          "/zephyr-ws/zephyr/include",
+          "/zephyr-ws/zephyr/kernel/include",
+          "/zephyr-ws/modules/**"
+        ],
+        "C_Cpp.default.defines": [
+          "__ZEPHYR__=1"
+        ]
+      }
+    }
+  }
+}

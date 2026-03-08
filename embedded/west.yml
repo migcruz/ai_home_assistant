@@ -1,0 +1,18 @@
+manifest:
+  version: "0.13"
+
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.3.0
+      # Pull in Zephyr's own west.yml so all required modules
+      # (hal_espressif, mbedtls, tfm, etc.) are fetched automatically.
+      import: west.yml
+
+  self:
+    # Must match the directory name inside the west workspace (/workdir/embedded).
+    path: embedded

@@ -1,0 +1,5 @@
+# west build output (one per project)
+*/build/
+
+# credentials — never commit WiFi passwords
+credentials.conf

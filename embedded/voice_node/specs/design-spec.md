@@ -242,7 +242,7 @@ Chime audio files are baked into firmware flash at build time. No external stora
 | Milestone | Scope | Status |
 |---|---|---|
 | **0 — Scaffold** | Both cores boot, LED blinks (procpu), both cores log over shared USB serial via IPM, shell accessible on procpu | Done |
-| **1 — Network** | WiFi connects, TLS handshake succeeds, WebSocket opens to server, text round-trip works | — |
+| **1 — Network** | WiFi connects, TLS handshake succeeds, WebSocket opens to server, text round-trip works | **In progress** |
 | **2 — Mic → Server** | PDM capture, WAV framing, audio streamed to server, server transcribes correctly | — |
 | **3 — Server → Speaker** | Binary WAV frames received, I2S playback through amp and speaker | — |
 | **4 — Full round-trip** | Button-triggered (not wake word): speak, hear response end-to-end | — |

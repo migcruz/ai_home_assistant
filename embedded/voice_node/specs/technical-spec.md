@@ -432,7 +432,7 @@ Each milestone is independently testable. Do not proceed to the next until the c
 | Milestone | Key tasks | Status |
 |---|---|---|
 | **0 — Scaffold** | Both cores boot (AMP sysbuild); procpu blinks LED + runs shell; appcpu forwards heartbeat logs to procpu via IPM; both visible on `/dev/ttyACM0` | Done |
-| **1 — Network** | WiFi connects; TLS handshake; WebSocket opens; text round-trip with server | — |
+| **1 — Network** | WiFi connects; TLS handshake; WebSocket opens; text round-trip with server | **In progress** |
 | **2 — Mic → Server** | PDM capture; WAV framing; stream to server; server transcribes correctly | — |
 | **3 — Server → Speaker** | Receive binary WAV frames; I2S playback through MAX98357A at 22050Hz | — |
 | **4 — Full round-trip** | Button-triggered (not wake word yet): speak → hear response end-to-end | — |
@@ -446,7 +446,7 @@ Each milestone is independently testable. Do not proceed to the next until the c
 
 | Question | Notes |
 |---|---|
-| Zephyr ESP32S3 WiFi stability | Espressif binary blob WiFi — less battle-tested than ESP-IDF. Validate WiFi + TLS + WebSocket path (Milestone 1) before building audio on top. |
+| Zephyr ESP32S3 WiFi stability | Basic WiFi + DHCP validated. TLS handshake and WebSocket path (remainder of Milestone 1) still to be confirmed under load. |
 | I2S @ 22050Hz | Non-power-of-two sample rate. Supported on ESP32S3 but verify Zephyr I2S driver handles it correctly with the clock configuration for MAX98357A. |
 | Wake word false positive rate | TFLite Micro models may trigger occasionally in a noisy room. Tune threshold; consider dedicated IC if unacceptable. |
 | VAD sensitivity | Energy-based VAD may cut off trailing words in a quiet room or fail to detect silence in a noisy one. May need tuning or a lightweight VAD model. |

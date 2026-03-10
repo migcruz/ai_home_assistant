@@ -17,7 +17,7 @@ static void ipm_rx_cb(const struct device *dev, void *ctx,
 	ARG_UNUSED(ctx);
 	ARG_UNUSED(id);
 
-	// LOG_INF("[C1] %s", (const char *)data);
+	LOG_INF("[C1] %s", (const char *)data);
 }
 
 int main(void)

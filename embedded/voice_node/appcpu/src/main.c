@@ -30,12 +30,15 @@ int main(void)
 		return -1;
 	}
 
+	// Wait 1 second for LittleFS and USB to intialize on procpu
+	k_sleep(K_MSEC(1000));
+
 	ipm_log(ipm, "appcpu starting");
 
 	uint32_t tick = 0;
 
 	while (1) {
-		ipm_log(ipm, "alive tick=%u uptime=%lld ms", tick, k_uptime_get());
+		// ipm_log(ipm, "alive tick=%u uptime=%lld ms", tick, k_uptime_get());
 		tick++;
 		k_sleep(K_MSEC(2000));
 	}

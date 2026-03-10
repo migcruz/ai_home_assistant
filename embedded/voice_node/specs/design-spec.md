@@ -32,7 +32,7 @@ graph TB
         CLASSAMP["Class D Amplifier"]
         SPK["Speaker"]
         BLE["BLE Peripheral (provisioning only)"]
-        NVS["NVS Flash (credentials)"]
+        LFS["LittleFS (credentials)"]
         LED["Status LED"]
         CON["USB Serial/JTAG (console + shell)"]
     end
@@ -63,8 +63,8 @@ graph TB
     WS -->|"WAV frames"| ABUF
     ABUF -->|"PCM"| I2S_OUT --> CLASSAMP --> SPK
 
-    BLE -->|"SSID + password"| NVS
-    NVS -->|"credentials"| WIFI
+    BLE -->|"SSID + password"| LFS
+    LFS -->|"credentials"| WIFI
 
     C1 -->|"log strings (IPM)"| CON
 ```
@@ -174,7 +174,7 @@ Playback starts on the first received frame — the device does not wait for all
 
 ## 4. WiFi Provisioning Flow
 
-Provisioning is triggered by holding the BOOT button at startup. On subsequent boots, credentials are read from NVS flash and the provisioning step is skipped entirely.
+Provisioning is triggered by holding the BOOT button at startup. On subsequent boots, credentials are read from LittleFS and the provisioning step is skipped entirely.
 
 ```
 Normal boot (credentials in NVS)

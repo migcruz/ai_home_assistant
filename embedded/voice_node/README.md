@@ -19,7 +19,7 @@ graph TB
         AMP["MAX98357A Class D Amp"]
         SPK["Speaker"]
         BLE["BLE Peripheral provisioning only"]
-        NVS["NVS Flash credentials"]
+        LFS["LittleFS credentials"]
         SHELL["Shell USB Serial/JTAG"]
     end
 
@@ -47,8 +47,8 @@ graph TB
     VSVC -->|"WAV frames"| WS
     WS --> ABUF --> I2S --> AMP --> SPK
 
-    BLE -->|"SSID + PSK"| NVS
-    NVS --> WIFI
+    BLE -->|"SSID + PSK"| LFS
+    LFS --> WIFI
 ```
 
 ---
@@ -128,6 +128,7 @@ embedded/voice_node/
 │   │   └── esp32s3_procpu_sense.overlay   # enables ipm0 for Core 0
 │   └── src/
 │       ├── main.c               # entry point, IPM receive callback, state machine
+│       ├── storage.c            # LittleFS mount + credential read/write
 │       ├── wifi.c               # WiFi connect + reconnect
 │       ├── provisioning.c       # BLE GATT provisioning
 │       ├── websocket.c          # WebSocket client + protocol framing

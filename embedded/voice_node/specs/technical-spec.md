@@ -62,7 +62,7 @@ XIAO ESP32S3       MAX98357A
 | I2S playback | Zephyr I2S driver — procpu |
 | Wake word | TensorFlow Lite Micro (`CONFIG_TENSORFLOW_LITE_MICRO`) — appcpu |
 | BLE provisioning | Zephyr BLE stack + GATT (`CONFIG_BT`, `CONFIG_BT_PERIPHERAL`) — procpu |
-| Credential storage | Zephyr NVS + settings subsystem — procpu |
+| Credential storage | LittleFS (`/lfs/wifi.conf`) — procpu |
 | Console / shell | USB Serial/JTAG owned by procpu; appcpu forwards logs via IPM |
 | Build system | west + CMake + sysbuild |
 | Toolchain | Zephyr SDK 0.17.4 (xtensa-espressif_esp32s3_zephyr-elf) |
@@ -109,10 +109,11 @@ CONFIG_BT=y
 CONFIG_BT_PERIPHERAL=y
 CONFIG_BT_GATT=y
 
-# ── Credential storage ────────────────────────────────────────────────────────
-CONFIG_SETTINGS=y
-CONFIG_SETTINGS_NVS=y
-CONFIG_NVS=y
+# ── Credential storage (LittleFS on storage_partition, 0x3b0000, 192KB) ──────
+CONFIG_FLASH=y
+CONFIG_FLASH_MAP=y
+CONFIG_FILE_SYSTEM=y
+CONFIG_FILE_SYSTEM_LITTLEFS=y
 
 # ── Shell (development) ───────────────────────────────────────────────────────
 CONFIG_SHELL=y
@@ -324,6 +325,7 @@ embedded/
     │   │   └── esp32s3_procpu_sense.overlay  # enables ipm0 for procpu
     │   └── src/
     │       ├── main.c           # entry point, IPM receive, state machine
+    │       ├── storage.c        # LittleFS mount + credential read/write
     │       ├── wifi.c           # WiFi connect + reconnect
     │       ├── provisioning.c   # BLE GATT provisioning
     │       ├── websocket.c      # WebSocket client + protocol framing
@@ -351,7 +353,7 @@ embedded/
 | image-1 (procpu slot 1) | `0x170000` | 1344 KB | OTA swap slot |
 | image-0-appcpu (slot 0) | `0x2c0000` | 448 KB | Active APP CPU image |
 | image-1-appcpu (slot 1) | `0x330000` | 448 KB | OTA swap slot |
-| storage | `0x3b0000` | 192 KB | NVS credentials |
+| storage | `0x3b0000` | 192 KB | LittleFS credentials |
 | image-scratch | `0x3e0000` | 124 KB | MCUboot swap scratch |
 | coredump | `0x3ff000` | 4 KB | Crash dump |
 
@@ -414,7 +416,7 @@ uart:~$
 Useful shell commands:
 ```
 wifi scan
-wifi connect <SSID> <password>
+wifi connect -s <SSID> -p <password> -k 1
 wifi status
 net iface
 net ping 192.168.1.x

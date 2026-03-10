@@ -4,10 +4,11 @@
     "dockerfile": "Dockerfile"
   },
 
-  // --privileged gives the container access to all host USB devices dynamically.
-  // Unlike --device=/dev/ttyACM0, this does NOT fail at startup if no board
-  // is plugged in. Devices appear inside the container as they are connected.
-  "runArgs": ["--privileged"],
+  // --privileged bypasses device cgroup restrictions.
+  // --volume=/dev:/dev bind-mounts the host /dev directly so USB devices
+  // plugged in after the container starts (e.g. ESP32 over ttyACM0) are
+  // immediately visible inside the container without a restart.
+  "runArgs": ["--privileged", "--volume=/dev:/dev"],
 
   // west-managed sources (zephyr/, modules/) live in a named volume at /zephyr-ws
   // so they persist across container rebuilds without cluttering the host.

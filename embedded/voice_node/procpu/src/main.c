@@ -47,6 +47,9 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 #define BTN_NODE DT_ALIAS(sw0)
 static const struct gpio_dt_spec btn = GPIO_DT_SPEC_GET(BTN_NODE, gpios);
 
+static struct gpio_callback btn_cb_data;
+static struct k_work        btn_work;
+
 static const struct device *ipm_dev;
 
 /* ── State ───────────────────────────────────────────────────────────────── */
@@ -111,6 +114,37 @@ static void log_audio_samples(uint32_t byte_count)
 		(double)byte_count / (16000.0 * 2.0 * 2.0));
 }
 
+/* ── Button work handler — runs in system workqueue (thread context) ─────── */
+static void btn_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	/* Re-read pin state here; both edges share one handler */
+	bool pressed = (gpio_pin_get_dt(&btn) == 1);
+
+	if (pressed && !recording) {
+		recording   = true;
+		audio_ready = false;
+		LOG_INF("[C0] button pressed — sending START to appcpu");
+		send_cmd(CMD_START);
+	} else if (!pressed && recording) {
+		recording = false;
+		LOG_INF("[C0] button released — sending STOP to appcpu");
+		send_cmd(CMD_STOP);
+	}
+}
+
+/* ── GPIO ISR — fires on both edges, defers work to thread context ───────── */
+static void btn_isr(const struct device *dev, struct gpio_callback *cb,
+		    uint32_t pins)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+
+	k_work_submit(&btn_work);
+}
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -131,7 +165,7 @@ int main(void)
 		LOG_ERR("[C0] LED GPIO not ready");
 		return -1;
 	}
-	gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
+	gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
 
 	if (!gpio_is_ready_dt(&btn)) {
 		LOG_ERR("[C0] BOOT button GPIO not ready");
@@ -139,41 +173,28 @@ int main(void)
 	}
 	gpio_pin_configure_dt(&btn, GPIO_INPUT);
 
+	k_work_init(&btn_work, btn_work_handler);
+	gpio_init_callback(&btn_cb_data, btn_isr, BIT(btn.pin));
+	gpio_add_callback(btn.port, &btn_cb_data);
+	gpio_pin_interrupt_configure_dt(&btn, GPIO_INT_EDGE_BOTH);
+
 	LOG_INF("[C0] ready — hold BOOT button to record");
 
-	bool btn_was_pressed = false;
+	int blink_ticks = 0;
 
 	while (1) {
-		/* gpio_pin_get_dt() accounts for GPIO_ACTIVE_LOW: 1 = pressed */
-		bool btn_pressed = (gpio_pin_get_dt(&btn) == 1);
-
-		if (btn_pressed && !btn_was_pressed) {
-			/* Rising edge of press */
-			if (!recording) {
-				recording = true;
-				audio_ready = false;
-				LOG_INF("[C0] button pressed — sending START to appcpu");
-				send_cmd(CMD_START);
-				gpio_pin_set_dt(&led, 1);
-			}
-		} else if (!btn_pressed && btn_was_pressed) {
-			/* Falling edge — button released */
-			if (recording) {
-				recording = false;
-				LOG_INF("[C0] button released — sending STOP to appcpu");
-				send_cmd(CMD_STOP);
-				gpio_pin_set_dt(&led, 0);
-			}
-		}
-
-		btn_was_pressed = btn_pressed;
-
-		/* Check if appcpu signalled recording done */
+		/* Button events are interrupt-driven; just wait for audio done */
 		if (audio_ready) {
 			audio_ready = false;
 			LOG_INF("[C0] audio ready in PSRAM — %u bytes", audio_byte_cnt);
 			log_audio_samples(audio_byte_cnt);
 			/* TODO: build WAV header + stream over WebSocket */
+		}
+
+		/* Blink at ~1Hz (500ms on, 500ms off = toggle every 25 × 20ms) */
+		if (++blink_ticks >= 25) {
+			gpio_pin_toggle_dt(&led);
+			blink_ticks = 0;
 		}
 
 		k_sleep(K_MSEC(20));

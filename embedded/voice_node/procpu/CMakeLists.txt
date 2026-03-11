@@ -9,4 +9,6 @@ target_sources(
     src/storage.c
     src/button.c
     src/audio.c
+    src/wifi.c
+    src/websocket.c
     )

@@ -225,7 +225,7 @@ Shell prompt: `uart:~$`. Both cores' log output appears here — procpu logs are
 |---|---|---|
 | 0 — Scaffold | Both cores boot (AMP); procpu blinks LED + shell; appcpu heartbeat via IPM | **Done** |
 | 1 — PDM capture | BOOT button (interrupt-driven) → appcpu captures PDM to shared PSRAM → procpu reads + validates via cache-safe IPM handshake | **Done** |
-| 2 — Network | WiFi + TLS handshake + WebSocket open + text round-trip | — |
+| 2 — Network | WiFi + TLS handshake + WebSocket open + text round-trip | **Done** |
 | 3 — Mic → Server | WAV framing from PSRAM, WebSocket streaming, server transcribes correctly | — |
 | 4 — Server → Speaker | Receive WAV frames, I2S playback through MAX98357A | — |
 | 5 — Full round-trip | End-to-end: speak → hear response | — |

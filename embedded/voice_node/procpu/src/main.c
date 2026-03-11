@@ -19,6 +19,8 @@
 #include "storage.h"
 #include "button.h"
 #include "audio.h"
+#include "wifi.h"
+#include "websocket.h"
 
 LOG_MODULE_REGISTER(procpu, LOG_LEVEL_DBG);
 
@@ -53,6 +55,7 @@ int main(void)
 
 	k_sleep(K_MSEC(500));
 	storage_init();
+	wifi_init();
 
 	ipm_dev = DEVICE_DT_GET(DT_NODELABEL(ipm0));
 	if (!device_is_ready(ipm_dev)) {
@@ -71,7 +74,10 @@ int main(void)
 		return -1;
 	}
 
-	LOG_INF("[C0] ready — hold BOOT button to record");
+	net_thread_start();
+
+	LOG_INF("[C0] ready — hold BOOT button to record; "
+		"connect WiFi via: wifi connect -s <SSID> -p <PSK> -k 1");
 
 	int blink_ticks = 0;
 
@@ -80,7 +86,8 @@ int main(void)
 			audio_ready = false;
 			LOG_INF("[C0] audio ready in PSRAM — %u bytes", audio_byte_cnt);
 			log_audio_samples(audio_byte_cnt);
-			/* TODO: build WAV header + stream over WebSocket */
+			/* TODO (Milestone 3): build WAV header, strip right channel,
+			 * call ws_send_text(end_audio_msg) to trigger STT pipeline */
 		}
 
 		if (++blink_ticks >= 25) {

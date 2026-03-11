@@ -241,11 +241,12 @@ Chime audio files are baked into firmware flash at build time. No external stora
 
 | Milestone | Scope | Status |
 |---|---|---|
-| **0 — Scaffold** | Both cores boot, LED blinks (procpu), both cores log over shared USB serial via IPM, shell accessible on procpu | Done |
-| **1 — Network** | WiFi connects, TLS handshake succeeds, WebSocket opens to server, text round-trip works | **In progress** |
-| **2 — Mic → Server** | PDM capture, WAV framing, audio streamed to server, server transcribes correctly | — |
-| **3 — Server → Speaker** | Binary WAV frames received, I2S playback through amp and speaker | — |
-| **4 — Full round-trip** | Button-triggered (not wake word): speak, hear response end-to-end | — |
-| **5 — Wake word** | TFLite Micro model replaces button trigger | — |
-| **6 — VAD** | Energy-based silence detection replaces fixed timeout | — |
-| **7 — Provisioning** | BLE provisioning flow replaces hardcoded credentials | — |
+| **0 — Scaffold** | Both cores boot, LED blinks (procpu), both cores log over shared USB serial via IPM, shell accessible on procpu | **Done** |
+| **1 — PDM capture** | BOOT button (interrupt-driven) → appcpu captures PDM to shared PSRAM → procpu reads + validates via cache-safe IPM handshake | **Done** |
+| **2 — Network** | WiFi connects (via shell), TLS handshake succeeds, WebSocket opens to server, config message sent | **Done** |
+| **3 — Mic → Server** | WAV framing from PSRAM (strip right channel), binary WebSocket stream, server transcribes correctly | — |
+| **4 — Server → Speaker** | Receive binary WAV frames, I2S playback through MAX98357A | — |
+| **5 — Full round-trip** | Button-triggered (not wake word yet): speak → hear response end-to-end | — |
+| **6 — Wake word** | TFLite Micro model replaces button trigger | — |
+| **7 — VAD** | Energy-based silence detection replaces fixed timeout | — |
+| **8 — Provisioning** | BLE provisioning flow replaces shell WiFi credentials | — |

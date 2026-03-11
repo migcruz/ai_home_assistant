@@ -35,6 +35,9 @@ A structured record of architectural choices made across the Home AI Assistant p
   - [Explicit DTS overlay paths](#explicit-dts-overlay-paths-not-zephyr-auto-discovery)
   - [PSRAM (8MB OPI) for audio buffers](#psram-8mb-opi-for-audio-buffers-and-networking-stack)
   - [WAV format for device ↔ server audio](#wav-format-for-device--server-audio)
+  - [net_thread stack placed in PSRAM via `.ext_ram.bss`](#net_thread-stack-placed-in-psram-via-ext_rambss)
+  - [`CONFIG_HEAP_MEM_POOL_SIZE` set to the Zephyr-enforced floor](#config_heap_mem_pool_size-set-to-the-zephyr-enforced-floor-45336-bytes)
+  - [DRAM pool and buffer reductions to fit the 185KB budget](#dram-pool-and-buffer-reductions-to-fit-the-185kb-budget)
 - [5. Networking and Security](#5-networking-and-security)
   - [HTTPS with self-signed certificate](#https-with-self-signed-certificate-acceptable-for-lan)
   - [Lazy DNS resolution in nginx](#lazy-dns-resolution-in-nginx-resolver-127001127011)
@@ -294,6 +297,47 @@ Kubernetes would add scheduler, etcd, and control plane overhead that is disprop
 
 ---
 
+### net_thread stack placed in PSRAM via `.ext_ram.bss`
+
+**Decision:** The `net_thread` (WiFi + TLS + WebSocket) stack is allocated as a plain `uint8_t` array with `__attribute__((section(".ext_ram.bss"))) __aligned(16)` rather than via `K_THREAD_STACK_DEFINE`. `k_thread_create` receives a raw cast `(k_thread_stack_t *)net_stack_mem`.
+
+**Alternatives:** `K_THREAD_STACK_DEFINE(net_stack, 16384)` — the standard Zephyr API; shrink the stack below 16KB.
+
+**Why:** `K_THREAD_STACK_DEFINE` unconditionally places stacks in `.dram0.noinit` (on-chip SRAM). At 16KB, this alone pushes the DRAM segment over budget. The `__attribute__((section(".ext_ram.bss")))` directive routes the array to the PSRAM linker region instead, freeing the 16KB from on-chip SRAM. The Xtensa LX7 has no MPU guard pages (requires `CONFIG_USERSPACE=y`), so stack overflow protection is absent regardless of where the stack lives — the PSRAM stack has no additional risk on this target. `CONFIG_ESP_SPIRAM` selects `SHARED_MULTI_HEAP`, which makes PSRAM a valid region for large allocations; the section attribute is the static equivalent of that runtime mechanism.
+
+---
+
+### `CONFIG_HEAP_MEM_POOL_SIZE` set to the Zephyr-enforced floor (45,336 bytes)
+
+**Decision:** `CONFIG_HEAP_MEM_POOL_SIZE=45336` — the minimum value Zephyr will accept given the WiFi + TLS + networking subsystem requirements. Any lower value is silently raised by CMake to the floor.
+
+**Alternatives:** Larger value (was briefly 48KB, then 64KB); smaller value.
+
+**Why:** This config is counterintuitive: **larger values make DRAM overflow worse**, not better. `CONFIG_HEAP_MEM_POOL_SIZE` allocates a **static BSS array in on-chip SRAM** — it is not a runtime heap that spills to PSRAM. It has nothing to do with the SHARED_MULTI_HEAP PSRAM pool (which is selected by `CONFIG_ESP_SPIRAM` and lives in `.ext_ram.data`). Large runtime allocations — mbedTLS session, LwIP buffers, WebSocket frame buffers — fall through to the 1MB PSRAM heap automatically. The static DRAM pool is only used for small, time-critical allocations where PSRAM latency matters. Setting it to 45,336 wastes the least DRAM while satisfying Zephyr's minimum subsystem requirements.
+
+---
+
+### DRAM pool and buffer reductions to fit the 185KB budget
+
+**Decision:** A set of Kconfig reductions targeting DRAM `.bss` symbols identified via the linker map (`zephyr_pre0.map`):
+
+| Config | Default → Value | Bytes freed | Rationale |
+|---|---|---|---|
+| `CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS` | 4 → 1 | ~3,792 | We open exactly 1 TLS session; 3 × 1,264-byte contexts wasted |
+| `CONFIG_NET_PKT_RX_COUNT` | 4 → 2 | ~2,304 | Single TCP/WS connection; 2 packet descriptors sufficient |
+| `CONFIG_NET_PKT_TX_COUNT` | 4 → 2 | ~2,304 | Same |
+| `CONFIG_NET_MAX_CONN` | 4 → 2 | small | Connection table |
+| `CONFIG_SHELL_BACKEND_SERIAL_TX_RING_BUFFER_SIZE` | 2,048 → 512 | 1,536 | Shell TX buffer; 512B is plenty for command echoes |
+| `CONFIG_ESP32_TIMER_TASK_STACK_SIZE` | 4,096 → 2,048 | 2,048 | ESP timer callbacks are simple; 2KB is sufficient |
+| `CONFIG_LOG_BUFFER_SIZE` | 1,024 → 512 | 512 | Logging ring buffer; risk: drops under burst logging at DEBUG level |
+| `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN` | 16,384 → 4,096 | runtime only | Per-connection TLS record buffer; voice frames are small JSON + WAV chunks |
+
+**Why:** After enabling WiFi + TLS + WebSocket, the DRAM segment overflowed by ~26KB. The reductions above, combined with the PSRAM stack move, brought DRAM usage to 184.4KB / 185KB (568 bytes headroom). The map file was the critical tool — it shows every `.dram0.bss` symbol with its size, making the largest controllable items visible. `NET_SOCKETS_TLS_MAX_CONTEXTS=4` was the single biggest surprise: the Zephyr default silently allocates four TLS context structs regardless of how many connections are actually opened.
+
+**Risk:** The 568-byte headroom means any new static global or increase to any pool size will cause a linker overflow. Future milestones (I2S playback, chime buffers) must allocate in PSRAM exclusively.
+
+---
+
 ### WAV format for device ↔ server audio
 
 **Decision:** The voice node streams audio to the server as WAV (standard RIFF header + raw 16kHz 16-bit mono PCM). The server responds with WAV frames.
@@ -386,8 +430,9 @@ That is not something you type from memory. Makefiles are universally understood
 | AMP instead of SMP | Two independent images to maintain; inter-core communication via IPM adds latency and complexity |
 | IPM single-slot, no queue | One message in-flight at a time; back-to-back sends must use `wait=1` (blocking) |
 | USB Serial/JTAG owned by procpu | appcpu cannot log directly; must forward via IPM; log strings truncated at 128 bytes |
-| Self-signed TLS | Browser shows cert warning on first visit; device uses `VERIFY_NONE` (no cert pinning) |
-| HEAP_MEM_POOL_SIZE=49152 | DRAM is tight; 64KB overflows DRAM by ~13KB; 48KB fits with margin but limits WiFi stack headroom |
+| Self-signed TLS | Browser shows cert warning on first visit; device uses `VERIFY_NONE` (no cert pinning until Milestone 8 LittleFS provisioning) |
+| DRAM headroom 568 bytes | `dram0_0_seg` is 99.7% full. Any new static global or pool increase overflows the linker. All future allocations must target PSRAM. |
+| `HEAP_MEM_POOL_SIZE` at floor (45,336) | Cannot reduce below Zephyr's enforced minimum without silently being overridden. Runtime heap is PSRAM via SHARED_MULTI_HEAP; this static pool is DRAM-only. |
 | LittleFS over NVS | More flexible API, but heavier footprint; NVS would be smaller for simple key-value storage |
 | Sentence-boundary TTS | Sentence detection on punctuation is fragile for lists, abbreviations, and decimal numbers |
 | No persistent WebSocket | ~300ms TLS handshake added to each wake latency |

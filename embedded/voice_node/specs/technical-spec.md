@@ -79,7 +79,8 @@ CONFIG_IPM=y                      # inter-processor mailbox (receives from appcp
 # ── PSRAM ─────────────────────────────────────────────────────────────────────
 CONFIG_ESP_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y          # XIAO ESP32S3 has OPI PSRAM — quad mode crashes
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# Selects SHARED_MULTI_HEAP: dual DRAM+PSRAM allocator; large runtime
+# allocs (mbedTLS, LwIP, WebSocket buffers) fall through to 1MB PSRAM heap.
 
 # ── WiFi ──────────────────────────────────────────────────────────────────────
 CONFIG_WIFI=y
@@ -91,23 +92,18 @@ CONFIG_NET_IPV4=y
 CONFIG_NET_TCP=y
 CONFIG_NET_SOCKETS=y
 CONFIG_DNS_RESOLVER=y
+CONFIG_NET_DHCPV4=y
+CONFIG_MDNS_RESOLVER=y            # resolves vulcan.local on the LAN
 
 # ── TLS ───────────────────────────────────────────────────────────────────────
 CONFIG_MBEDTLS=y
 CONFIG_NET_SOCKETS_SOCKOPT_TLS=y
-CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS=4
+CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS=1   # default was 4; we open exactly 1 session
+CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096 # reduced from 16KB; voice frames are small
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 CONFIG_WEBSOCKET_CLIENT=y
 CONFIG_HTTP_CLIENT=y
-
-# ── I2S playback ──────────────────────────────────────────────────────────────
-CONFIG_I2S=y
-
-# ── BLE provisioning ──────────────────────────────────────────────────────────
-CONFIG_BT=y
-CONFIG_BT_PERIPHERAL=y
-CONFIG_BT_GATT=y
 
 # ── Credential storage (LittleFS on storage_partition, 0x3b0000, 192KB) ──────
 CONFIG_FLASH=y
@@ -119,8 +115,17 @@ CONFIG_FILE_SYSTEM_LITTLEFS=y
 CONFIG_SHELL=y
 CONFIG_SHELL_BACKEND_SERIAL=y
 CONFIG_NET_SHELL=y
-CONFIG_NET_L2_WIFI_SHELL=y
-CONFIG_GPIO_SHELL=y
+CONFIG_NET_L2_WIFI_SHELL=y        # wifi connect/status/scan
+
+# ── DRAM budget tuning (185KB DRAM, 99.7% used — very tight) ─────────────────
+CONFIG_HEAP_MEM_POOL_SIZE=45336           # Zephyr-enforced floor; cannot go lower
+CONFIG_NET_PKT_RX_COUNT=2                 # down from 4; single WS connection only
+CONFIG_NET_PKT_TX_COUNT=2
+CONFIG_NET_MAX_CONN=2
+CONFIG_SHELL_BACKEND_SERIAL_TX_RING_BUFFER_SIZE=512  # down from 2048
+CONFIG_ESP32_TIMER_TASK_STACK_SIZE=2048              # down from 4096
+CONFIG_LOG_BUFFER_SIZE=512                           # down from 1024
+# net_thread stack (16KB) placed in PSRAM via __attribute__((section(".ext_ram.bss")))
 ```
 
 **appcpu/prj.conf** (Core 1 — wake word, VAD, mic capture):
@@ -431,14 +436,15 @@ Each milestone is independently testable. Do not proceed to the next until the c
 
 | Milestone | Key tasks | Status |
 |---|---|---|
-| **0 — Scaffold** | Both cores boot (AMP sysbuild); procpu blinks LED + runs shell; appcpu forwards heartbeat logs to procpu via IPM; both visible on `/dev/ttyACM0` | Done |
-| **1 — Network** | WiFi connects; TLS handshake; WebSocket opens; text round-trip with server | **In progress** |
-| **2 — Mic → Server** | PDM capture; WAV framing; stream to server; server transcribes correctly | — |
-| **3 — Server → Speaker** | Receive binary WAV frames; I2S playback through MAX98357A at 22050Hz | — |
-| **4 — Full round-trip** | Button-triggered (not wake word yet): speak → hear response end-to-end | — |
-| **5 — Wake word** | Integrate TFLite Micro model; replace button press with keyword detection | — |
-| **6 — VAD** | Replace fixed timeout with RMS-based voice activity detection | — |
-| **7 — Provisioning** | BLE GATT provisioning flow; NVS credential storage; replace hardcoded creds | — |
+| **0 — Scaffold** | Both cores boot (AMP sysbuild); procpu blinks LED + runs shell; appcpu forwards heartbeat logs to procpu via IPM; both visible on `/dev/ttyACM0` | **Done** |
+| **1 — PDM capture** | Interrupt-driven BOOT button → IPM cmd → appcpu PDM→PSRAM via I2S DMA → cache flush → IPM done → procpu validates sample log | **Done** |
+| **2 — Network** | WiFi connects (via shell); TLS handshake (VERIFY_NONE); WebSocket opens to server; config message sent; recv loop running | **Done** |
+| **3 — Mic → Server** | WAV framing from PSRAM (strip right channel, mono); binary WebSocket stream; server transcribes correctly | — |
+| **4 — Server → Speaker** | Receive binary WAV frames; I2S playback through MAX98357A at 22050Hz | — |
+| **5 — Full round-trip** | Button-triggered (not wake word yet): speak → hear response end-to-end | — |
+| **6 — Wake word** | Integrate TFLite Micro model on appcpu; replace button press with keyword detection | — |
+| **7 — VAD** | Replace fixed timeout with RMS-based voice activity detection | — |
+| **8 — Provisioning** | BLE GATT provisioning flow; LittleFS credential storage; replace shell WiFi connect | — |
 
 ---
 
@@ -446,7 +452,7 @@ Each milestone is independently testable. Do not proceed to the next until the c
 
 | Question | Notes |
 |---|---|
-| Zephyr ESP32S3 WiFi stability | Basic WiFi + DHCP validated. TLS handshake and WebSocket path (remainder of Milestone 1) still to be confirmed under load. |
+| Zephyr ESP32S3 WiFi stability | WiFi, DHCP, TLS handshake (VERIFY_NONE), and WebSocket open all confirmed working on hardware (Milestone 2 done). Long-term reconnect resilience not yet stress-tested. |
 | I2S @ 22050Hz | Non-power-of-two sample rate. Supported on ESP32S3 but verify Zephyr I2S driver handles it correctly with the clock configuration for MAX98357A. |
 | Wake word false positive rate | TFLite Micro models may trigger occasionally in a noisy room. Tune threshold; consider dedicated IC if unacceptable. |
 | VAD sensitivity | Energy-based VAD may cut off trailing words in a quiet room or fail to detect silence in a noisy one. May need tuning or a lightweight VAD model. |

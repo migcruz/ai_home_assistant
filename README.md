@@ -31,6 +31,7 @@ graph LR
 | Vector Search | Vespa |
 | Database | PostgreSQL |
 | GPU | RTX 5090 (NVIDIA Container Toolkit) |
+| Embedded RTOS | Zephyr 4.3.0 (ESP32-S3 voice node) |
 
 ---
 

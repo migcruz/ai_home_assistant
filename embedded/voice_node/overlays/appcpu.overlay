@@ -5,6 +5,10 @@
  * under simultaneous heavy logging but acceptable for debug.
  */
 
+#include <zephyr/dt-bindings/pinctrl/esp-pinctrl-common.h>
+#include <zephyr/dt-bindings/pinctrl/esp32s3-gpio-sigmap.h>
+#include <zephyr/dt-bindings/pinctrl/esp32s3-pinctrl.h>
+
 / {
 	chosen {
 		zephyr,console = &usb_serial;
@@ -17,4 +21,31 @@
 
 &ipm0 {
 	status = "okay";
+};
+
+/*
+ * PDM microphone — MSM261S4030H0R (built into XIAO ESP32S3 Sense)
+ *   CLK  GPIO41 → I2S0_I_BCK (output from ESP32, drives mic clock)
+ *   DATA GPIO42 → I2S0_I_SD  (input to ESP32, PDM data from mic)
+ *
+ * NOTE: if PDM clock/data are swapped at runtime, swap GPIO41 ↔ GPIO42 here.
+ */
+&pinctrl {
+	i2s0_pdm_rx_default: i2s0_pdm_rx_default {
+		group1 {
+			pinmux = <I2S0_I_BCK_GPIO41>,
+				 <I2S0_I_SD_GPIO42>;
+		};
+	};
+};
+
+/* DMA controller required by the I2S driver (i2s0 uses channels 2/3) */
+&dma {
+	status = "okay";
+};
+
+&i2s0 {
+	status = "okay";
+	pinctrl-0 = <&i2s0_pdm_rx_default>;
+	pinctrl-names = "default";
 };

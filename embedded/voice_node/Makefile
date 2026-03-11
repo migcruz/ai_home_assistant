@@ -9,7 +9,7 @@ APPCPU_OVERLAY := $(CURDIR)/overlays/appcpu.overlay
 all:
 	west build --sysbuild -d $(BUILD) -b $(BOARD) procpu \
 		-- -DDTC_OVERLAY_FILE=$(PROCPU_OVERLAY) \
-		   -Dappcpu_DTC_OVERLAY_FILE=$(APPCPU_OVERLAY)
+		   -Dvoice_node_appcpu_DTC_OVERLAY_FILE=$(APPCPU_OVERLAY)
 
 clean:
 	rm -rf $(BUILD)
@@ -20,4 +20,4 @@ flash:
 menuconfig:
 	west build --sysbuild -d $(BUILD) -b $(BOARD) -t menuconfig procpu \
 		-- -DDTC_OVERLAY_FILE=$(PROCPU_OVERLAY) \
-		   -Dappcpu_DTC_OVERLAY_FILE=$(APPCPU_OVERLAY)
+		   -Dvoice_node_appcpu_DTC_OVERLAY_FILE=$(APPCPU_OVERLAY)

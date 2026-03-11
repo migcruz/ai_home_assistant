@@ -66,11 +66,17 @@ The ESP32-S3 is a dual-core LX7. Zephyr 4.3.0 does not implement SMP on this chi
 
 ### Inter-Core Communication (IPM)
 
-Cores communicate via `espressif,esp32-ipm` — a shared memory mailbox with a 1KB payload slot. The driver does not queue messages; each send must complete before the next. The appcpu sends:
+Cores communicate via `espressif,esp32-ipm` — a shared memory mailbox with a 1KB payload slot. The driver does not queue messages; each send must complete before the next.
 
-- **Wake events** — triggers the procpu to open the WebSocket and start streaming
-- **End-of-speech events** — triggers the procpu to send `end_audio` to the server
-- **Log strings** — printed by the procpu with a `[C1]` prefix on the shared USB serial console
+Current IPM message IDs:
+
+| ID | Direction | Payload | Purpose |
+|---|---|---|---|
+| 0 | appcpu → procpu | `char[]` log string | Forward appcpu log lines; procpu prints with `[C1]` prefix |
+| 1 | procpu → appcpu | `uint8_t` (1=start, 0=stop) | BOOT button press/release → start/stop PDM capture |
+| 2 | appcpu → procpu | `uint32_t` byte_count | PDM capture complete; procpu reads PSRAM audio buffer |
+
+Future IDs will carry wake word events and end-of-speech signals once TFLite Micro and VAD are added.
 
 ### WebSocket Wire Protocol
 
@@ -120,30 +126,24 @@ embedded/voice_node/
 │   ├── functional-spec.md       # what the device does
 │   ├── design-spec.md           # architecture, state machine, audio flows
 │   └── technical-spec.md        # BOM, Kconfig, flash layout, build commands
+├── overlays/                    # DTS overlays passed explicitly via -DDTC_OVERLAY_FILE
+│   ├── procpu.overlay           # ipm0 enable, BOOT button (GPIO0, sw0 alias)
+│   └── appcpu.overlay           # ipm0, DMA, I2S0 PDM pinctrl (GPIO41 CLK, GPIO42 DATA)
 ├── procpu/                      # PRO CPU image (Core 0)
 │   ├── CMakeLists.txt
 │   ├── sysbuild.cmake           # registers appcpu as remote image
-│   ├── prj.conf                 # Kconfig: IPM, WiFi, TLS, WebSocket, I2S, BLE, shell
-│   ├── socs/
-│   │   └── esp32s3_procpu_sense.overlay   # enables ipm0 for Core 0
+│   ├── prj.conf                 # Kconfig: IPM, WiFi, TLS, WebSocket, I2S, shell
 │   └── src/
-│       ├── main.c               # entry point, IPM receive callback, state machine
+│       ├── main.c               # entry point, IPM receive, blink loop
 │       ├── storage.c            # LittleFS mount + credential read/write
-│       ├── wifi.c               # WiFi connect + reconnect
-│       ├── provisioning.c       # BLE GATT provisioning
-│       ├── websocket.c          # WebSocket client + protocol framing
-│       ├── audio_capture.c      # PDM mic → PCM → WAV framing
-│       ├── audio_playback.c     # WAV frames → I2S → MAX98357A → speaker
-│       └── chime.c              # acknowledgement and error chimes
+│       ├── button.c/h           # BOOT button: GPIO interrupt → k_work → IPM CMD
+│       └── audio.c/h            # PSRAM pointer, cache invalidate, log_audio_samples()
 └── appcpu/                      # APP CPU image (Core 1)
     ├── CMakeLists.txt
-    ├── prj.conf                 # Kconfig: IPM only — no shell, no log backend
-    ├── boards/
-    │   └── xiao_esp32s3_appcpu.overlay    # enables ipm0 for Core 1
+    ├── prj.conf                 # Kconfig: IPM, DMA, I2S, PSRAM (OPI)
     └── src/
-        ├── main.c               # entry point; ipm_log() forwards debug strings to procpu
-        ├── wake_word.c          # TFLite Micro inference; sends wake event via IPM
-        └── vad.c                # RMS-based silence detection; sends end-of-speech via IPM
+        ├── main.c               # entry point, IPM command handler, orchestration
+        └── pdm.c/h              # I2S PDM init, DMA slab, pdm_record(), cache flush
 ```
 
 ---
@@ -214,6 +214,8 @@ Shell prompt: `uart:~$`. Both cores' log output appears here — procpu logs are
 - **Server-side STT/LLM/TTS** — Whisper, Ollama, and Piper run on the server. The device only streams raw audio and plays back WAV. This keeps firmware complexity low and lets the server be upgraded independently.
 - **No persistent WebSocket** — The connection opens on wake and closes after playback drains. Idle state carries no open socket, which simplifies reconnection and reduces power draw.
 - **OPI PSRAM** — The XIAO ESP32S3 uses Octal PSRAM. `CONFIG_SPIRAM_MODE_OCT=y` is required; the default Quad mode causes a boot crash.
+- **I2S DMA always stereo** — The ESP32-S3 I2S DMA controller only operates in stereo (`channels=2`); `channels=1` is rejected with `EINVAL`. The mono PDM mic outputs on the left channel; the right channel carries zeros. WAV streaming strips alternate samples before sending.
+- **PSRAM cache coherency** — Both cores access PSRAM through independent L1 data caches with no hardware coherency. After `pdm_record()` writes the capture buffer, appcpu calls `sys_cache_data_flush_range()` before sending the IPM done signal. procpu calls `sys_cache_data_invd_range()` before reading, ensuring it sees appcpu's data rather than its own stale cache lines.
 
 ---
 
@@ -222,10 +224,11 @@ Shell prompt: `uart:~$`. Both cores' log output appears here — procpu logs are
 | # | Scope | Status |
 |---|---|---|
 | 0 — Scaffold | Both cores boot (AMP); procpu blinks LED + shell; appcpu heartbeat via IPM | **Done** |
-| 1 — Network | WiFi + TLS handshake + WebSocket open + text round-trip | **In progress** |
-| 2 — Mic → Server | PDM capture, WAV framing, streaming, server transcribes correctly | — |
-| 3 — Server → Speaker | Receive WAV frames, I2S playback through MAX98357A | — |
-| 4 — Full round-trip | Button-triggered end-to-end: speak → hear response | — |
-| 5 — Wake word | TFLite Micro on appcpu replaces button trigger | — |
-| 6 — VAD | RMS silence detection replaces fixed timeout | — |
-| 7 — Provisioning | BLE GATT provisioning, NVS credential storage | — |
+| 1 — PDM capture | BOOT button (interrupt-driven) → appcpu captures PDM to shared PSRAM → procpu reads + validates via cache-safe IPM handshake | **Done** |
+| 2 — Network | WiFi + TLS handshake + WebSocket open + text round-trip | — |
+| 3 — Mic → Server | WAV framing from PSRAM, WebSocket streaming, server transcribes correctly | — |
+| 4 — Server → Speaker | Receive WAV frames, I2S playback through MAX98357A | — |
+| 5 — Full round-trip | End-to-end: speak → hear response | — |
+| 6 — Wake word | TFLite Micro on appcpu replaces BOOT button trigger | — |
+| 7 — VAD | RMS silence detection replaces fixed timeout | — |
+| 8 — Provisioning | BLE GATT provisioning, NVS credential storage | — |

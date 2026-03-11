@@ -7,4 +7,6 @@ target_sources(
     PRIVATE
     src/main.c
     src/storage.c
+    src/button.c
+    src/audio.c
     )

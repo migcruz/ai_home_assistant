@@ -47,11 +47,11 @@ All builds happen inside a Dev Container; flashing runs in the dev container as 
     ├── .devcontainer/
     │   ├── Dockerfile       ← zephyr-build + SDK 0.17.4 (all toolchains)
     │   └── devcontainer.json
-    └── voice_node/          ← voice firmware
-        ├── src/main.c
-        ├── prj.conf
-        ├── CMakeLists.txt
-        └── Makefile
+    └── voice_node/          ← voice firmware (AMP: procpu + appcpu)
+        ├── Makefile
+        ├── overlays/        ← explicit DTS overlays for both cores
+        ├── procpu/          ← Core 0 image (WiFi, WebSocket, button, shell)
+        └── appcpu/          ← Core 1 image (PDM mic capture)
 ```
 
 ---

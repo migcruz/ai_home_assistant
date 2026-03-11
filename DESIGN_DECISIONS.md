@@ -4,6 +4,50 @@ A structured record of architectural choices made across the Home AI Assistant p
 
 ---
 
+## Table of Contents
+
+- [1. System Architecture](#1-system-architecture)
+  - [Local-only inference — no cloud APIs](#local-only-inference--no-cloud-apis)
+  - [Onyx as the RAG platform](#onyx-as-the-rag-platform-pre-built-docker-images-not-forked)
+  - [Separate services for webui, voice, and nginx](#separate-services-for-webui-voice-and-nginx-not-a-monolith)
+  - [Docker Compose as the unifying deployment model](#docker-compose-as-the-unifying-deployment-model)
+- [2. Frontend](#2-frontend)
+  - [Static build (Vite + TypeScript → nginx:alpine)](#static-build-vite--typescript--nginxalpine)
+  - [Content-hashed assets + Cache-Control](#content-hashed-assets--cache-controlmax-age31536000-for-jscss-no-cache-for-indexhtml)
+  - [AudioContext keepalive (silent oscillator)](#audiocontext-keepalive-silent-oscillator)
+- [3. Voice Pipeline](#3-voice-pipeline)
+  - [WebSocket for voice communication](#websocket-for-voice-communication-not-http-polling-or-sse)
+  - [Sentence-boundary TTS with concurrent synthesis](#sentence-boundary-tts-with-concurrent-synthesis)
+  - [Whisper (faster-whisper, medium, CUDA float16)](#whisper-faster-whisper-medium-cuda-float16)
+  - [Piper for TTS](#piper-for-tts-local-onnx-based)
+  - [Server-side STT/LLM/TTS orchestration](#server-side-sttllmtts-orchestration-not-client-side)
+- [4. Embedded Firmware](#4-embedded-firmware)
+  - [Zephyr RTOS with AMP](#zephyr-rtos-with-amp-two-independent-images-one-per-core)
+  - [IPM for inter-core communication](#ipm-espressifespressif-esp32-ipm-for-inter-core-communication)
+  - [USB Serial/JTAG owned by procpu](#usb-serialjtag-owned-by-procpu-appcpu-logs-forwarded-via-ipm)
+  - [TFLite Micro wake word on APP CPU](#tflite-micro-wake-word-on-app-cpu-core-1-not-pro-cpu)
+  - [LittleFS for credential storage](#littlefs-for-credential-storage-not-zephyr-nvs)
+  - [No persistent WebSocket](#no-persistent-websocket--open-on-wake-close-after-playback)
+  - [PDM capture on APP CPU — PSRAM as shared audio buffer](#pdm-capture-on-app-cpu--psram-as-shared-audio-buffer-ipm-as-handshake)
+  - [I2S DMA requires stereo (channels=2)](#i2s-dma-requires-stereo-channels2-on-esp32-s3)
+  - [PSRAM cache coherency](#psram-cache-coherency-explicit-flush--invalidate-at-recording-boundaries)
+  - [BOOT button as interrupt-driven GPIO with k_work deferral](#boot-button-as-interrupt-driven-gpio-with-k_work-deferral)
+  - [Explicit DTS overlay paths](#explicit-dts-overlay-paths-not-zephyr-auto-discovery)
+  - [PSRAM (8MB OPI) for audio buffers](#psram-8mb-opi-for-audio-buffers-and-networking-stack)
+  - [WAV format for device ↔ server audio](#wav-format-for-device--server-audio)
+- [5. Networking and Security](#5-networking-and-security)
+  - [HTTPS with self-signed certificate](#https-with-self-signed-certificate-acceptable-for-lan)
+  - [Lazy DNS resolution in nginx](#lazy-dns-resolution-in-nginx-resolver-127001127011)
+  - [API key server-side only](#api-key-server-side-only-never-sent-to-browser-clients)
+  - [Read-only host mounts for indexed directories](#read-only-host-mounts-for-indexed-directories)
+- [6. Development Environment](#6-development-environment)
+  - [Embedded toolchain in a Dev Container](#embedded-toolchain-in-a-dev-container-not-native-host-install)
+  - [Makefile wrappers for west build --sysbuild](#makefile-wrappers-for-west-build---sysbuild)
+  - [credentials.conf pattern for dev-time WiFi credentials](#credentialsconf-pattern-for-dev-time-wifi-credentials)
+- [7. Tradeoffs and Known Limitations](#7-tradeoffs-and-known-limitations)
+
+---
+
 ## 1. System Architecture
 
 ### Local-only inference — no cloud APIs
@@ -190,6 +234,56 @@ Kubernetes would add scheduler, etcd, and control plane overhead that is disprop
 
 ---
 
+### PDM capture on APP CPU — PSRAM as shared audio buffer, IPM as handshake
+
+**Decision:** appcpu owns the I2S peripheral and PDM microphone entirely. It writes captured PCM into a fixed region of shared PSRAM (`0x3C000000`, 512KB). When recording stops, it flushes its data cache and sends an IPM `DONE` message (id=2) with the byte count. procpu reads the buffer directly via pointer after invalidating its own cache.
+
+**Alternatives:** appcpu streams PCM to procpu block-by-block over IPM (too slow — IPM is 1KB max, one in-flight at a time); DMA from I2S directly into PSRAM (PSRAM is not a valid DMA destination without additional config); appcpu holds audio in on-chip SRAM and signals procpu to DMA it.
+
+**Why:** PSRAM is accessible to both cores as a normal memory-mapped region through their data caches. A pointer read from procpu is zero-overhead — no DMA engine, no protocol, no copy. The IPM `DONE` message serves purely as a synchronisation signal, not a data carrier. This keeps the data path simple and the IPM channel free for other messages during recording (log strings). The only constraint is the cache coherency protocol (see below).
+
+---
+
+### I2S DMA requires stereo (channels=2) on ESP32-S3
+
+**Decision:** The I2S driver is configured with `channels=2` even though the PDM microphone is mono. Mic data arrives on the left channel; the right channel is zeros.
+
+**Alternatives:** `channels=1` (rejected at runtime with `EINVAL`); two microphones for true stereo.
+
+**Why:** The ESP32-S3 GDMA controller paired with I2S only operates in stereo mode. The Zephyr driver validates this and returns `EINVAL` for `channels=1`. This was confirmed empirically — the driver source has no non-DMA fallback path. The practical consequence: the PSRAM buffer holds stereo-interleaved PCM, and WAV framing strips alternate samples (right channel) before sending to the server. Also confirmed: `I2S_FMT_DATA_FORMAT_LEFT_JUSTIFIED` is not supported by the driver — `I2S_FMT_DATA_FORMAT_I2S` must be used, or `i2s_configure` also returns `EINVAL`.
+
+---
+
+### PSRAM cache coherency: explicit flush + invalidate at recording boundaries
+
+**Decision:** After `pdm_record()` completes, appcpu calls `sys_cache_data_flush_range(audio_buf, bytes_written)` before sending the IPM `DONE` signal. procpu calls `sys_cache_data_invd_range(audio_buf, byte_count)` before reading.
+
+**Alternatives:** Rely on IPM to act as a de-facto barrier (works in practice but is not guaranteed); use write-through cache mode for PSRAM (wastes bandwidth on every write); declare the PSRAM region `volatile` (prevents compiler optimization but does not flush the cache).
+
+**Why:** Each core has an independent L1 data cache. Writes to PSRAM from appcpu may remain in appcpu's cache and never reach PSRAM before procpu tries to read. Without the flush, procpu reads whatever was in its own cache for that address range — potentially stale data from a previous recording or zeros. `sys_cache_data_flush_range` pushes dirty appcpu cache lines to PSRAM. `sys_cache_data_invd_range` discards procpu's cached copy, forcing a fresh PSRAM read. The IPM send/receive is not a sufficient memory barrier because it operates on a different shared memory region (internal SRAM) than the audio buffer (external PSRAM).
+
+---
+
+### BOOT button as interrupt-driven GPIO with k_work deferral
+
+**Decision:** The BOOT button (GPIO0, active-low) is configured with `GPIO_INT_EDGE_BOTH`. The ISR calls `k_work_submit()` only. The work handler (`btn_work_handler`) runs in the system workqueue, reads the current pin state, and sends the IPM command.
+
+**Alternatives:** Polling the GPIO in the main loop every N ms; using a dedicated thread blocked on a semaphore posted from the ISR.
+
+**Why:** Polling wastes CPU proportionally to the poll rate — at 20ms intervals it still burns ~5% of core cycles checking a pin that changes rarely. GPIO interrupts let the hardware notify the CPU exactly when the state changes, with zero idle cost. The ISR cannot call `LOG_INF` or `ipm_send` directly because those are not ISR-safe (they may block or acquire mutexes). `k_work_submit` is ISR-safe and defers execution to the system workqueue, which runs at thread priority. Re-reading the pin state in the work handler (rather than capturing it in the ISR) handles the edge case where multiple edges arrive faster than the workqueue drains — the handler always acts on the current, settled state.
+
+---
+
+### Explicit DTS overlay paths (not Zephyr auto-discovery)
+
+**Decision:** DTS overlays live in a flat `overlays/` directory and are passed explicitly via `-DDTC_OVERLAY_FILE` (procpu) and `-Dvoice_node_appcpu_DTC_OVERLAY_FILE` (appcpu) in the Makefile. Zephyr's auto-discovery paths (`boards/<board>.overlay`, `socs/<soc>.overlay`) are not used.
+
+**Alternatives:** Conventional paths under `procpu/boards/` and `appcpu/boards/` for auto-discovery.
+
+**Why:** Auto-discovery works but is implicit — it's not obvious from looking at the Makefile or CMakeLists that overlays exist or which file is applied. Explicit `-D` flags make the build inputs self-documenting and allow the overlay location to be changed without renaming files to match board conventions. The variable prefix for the appcpu overlay must match the sysbuild application name exactly (`voice_node_appcpu`, from `ExternalZephyrProject_Add(APPLICATION voice_node_appcpu ...)` in `sysbuild.cmake`) — using a shorter prefix (`appcpu_`) silently has no effect because Zephyr ignores unknown CMake variables.
+
+---
+
 ### PSRAM (8MB OPI) for audio buffers and networking stack
 
 **Decision:** All large allocations — TLS session, networking stack, audio record/playback buffers, TFLite model — live in the 8MB Octal PSRAM. On-chip SRAM holds only the Zephyr kernel, interrupt handlers, and time-critical paths.
@@ -299,3 +393,7 @@ That is not something you type from memory. Makefiles are universally understood
 | No persistent WebSocket | ~300ms TLS handshake added to each wake latency |
 | Piper TTS (CPU) | Voice quality is good but below neural cloud APIs; no emotional prosody control |
 | Onyx pre-built images | Cannot patch Onyx internals; must wait for upstream to fix bugs in RAG layer |
+| I2S DMA stereo-only | PSRAM buffer holds stereo-interleaved PCM; right channel (zeros) must be stripped before WAV streaming — doubles memory and bandwidth for a mono mic |
+| PSRAM cache flush/invalidate | Small latency penalty at recording boundaries; required for correctness — without it procpu may read stale cache data silently |
+| Explicit DTS overlay paths | Overlay variable prefix must match sysbuild application name exactly; wrong prefix silently has no effect |
+| k_work button deferral | Work handler reads pin state after ISR fires — rapid double-edges collapse into one handler call; acceptable for a human-pressed button |

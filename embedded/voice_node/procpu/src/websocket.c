@@ -3,16 +3,22 @@
  *
  * net_thread flow:
  *   wifi_wait_for_dhcp()          block until shell "wifi connect" completes
- *   tls_socket_connect()          DNS lookup + TLS handshake (VERIFY_NONE)
+ *   tls_socket_connect()          DNS lookup + TLS handshake
  *   websocket_connect()           HTTP 101 upgrade → ws_fd
  *   ws_send_text(config_msg)      announce wav/16kHz capability
  *   recv_loop()                   log all server messages; break on error
  *   k_sleep(3s)                   back-off before retry
  *   if WiFi dropped → wifi_wait_for_dhcp() again
  *
- * TLS peer verification is disabled (TLS_PEER_VERIFY_NONE) — the connection
- * is still encrypted; we simply skip certificate validation.  Proper cert
- * pinning via LittleFS is a future TODO (Milestone 8 — provisioning).
+ * TLS: the pinned server CA cert (server_cert.h) is loaded via
+ * TLS_SEC_TAG_LIST.  Peer verification is set to NONE because the server
+ * uses a self-signed certificate; proper chain validation will be added in
+ * Milestone 8 (provisioning) once cert distribution is designed.
+ *
+ * The mbedTLS heap (60KB) is placed in PSRAM at link time via
+ * CONFIG_MBEDTLS_HEAP_CUSTOM_SECTION.  The ESP32S3 linker script maps the
+ * .mbedtls_heap section directly into .ext_ram.data (PSRAM), so TLS
+ * allocations cost zero DRAM.
  */
 
 #include <zephyr/kernel.h>
@@ -27,8 +33,12 @@
 
 #include "wifi.h"
 #include "websocket.h"
+#include "server_cert.h"
 
 LOG_MODULE_DECLARE(procpu, LOG_LEVEL_DBG);
+
+/* TLS credential tag for the pinned server CA certificate */
+#define VOICE_CA_TAG  1
 
 /* ── Thread ──────────────────────────────────────────────────────────────── */
 #define NET_STACK_SIZE  16384
@@ -87,9 +97,23 @@ static int tls_socket_connect(void)
 		return -errno;
 	}
 
-	/* Disable peer certificate verification — self-signed LAN cert.
-	 * TODO (Milestone 8): load /lfs/ca.crt and use TLS_PEER_VERIFY_REQUIRED
-	 */
+	/* Associate the pinned CA cert with this socket.
+	 * tls_check_credentials() validates the cert at setsockopt time;
+	 * the 60KB mbedTLS heap in PSRAM provides the memory for parsing. */
+	static const sec_tag_t sec_tags[] = { VOICE_CA_TAG };
+
+	ret = zsock_setsockopt(sock, SOL_TLS, TLS_SEC_TAG_LIST,
+			       sec_tags, sizeof(sec_tags));
+	if (ret < 0) {
+		LOG_ERR("[C0] setsockopt TLS_SEC_TAG_LIST failed: %d", errno);
+		zsock_close(sock);
+		zsock_freeaddrinfo(res);
+		return -errno;
+	}
+	LOG_INF("[C0] setsockopt TLS_SEC_TAG_LIST OK");
+
+	/* Skip chain validation — cert is self-signed; we pin it instead.
+	 * Proper REQUIRED validation deferred to Milestone 8. */
 	int verify = TLS_PEER_VERIFY_NONE;
 
 	ret = zsock_setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY,
@@ -99,6 +123,48 @@ static int tls_socket_connect(void)
 		zsock_close(sock);
 		zsock_freeaddrinfo(res);
 		return -errno;
+	}
+	LOG_INF("[C0] setsockopt TLS_PEER_VERIFY OK");
+
+	/* TLS hostname for SNI — must match CN/SAN in the pinned cert. */
+	ret = zsock_setsockopt(sock, SOL_TLS, TLS_HOSTNAME,
+			       VOICE_SERVER_TLS_HOST,
+			       strlen(VOICE_SERVER_TLS_HOST));
+	if (ret < 0) {
+		LOG_ERR("[C0] setsockopt TLS_HOSTNAME failed: %d", errno);
+		zsock_close(sock);
+		zsock_freeaddrinfo(res);
+		return -errno;
+	}
+	LOG_INF("[C0] setsockopt TLS_HOSTNAME OK");
+
+	/* Verify cert is still in credential store before connecting.
+	 * Use a tiny buffer: -ENOENT → missing, -EFBIG → present (expected). */
+	{
+		uint8_t probe = 0;
+		size_t probe_len = sizeof(probe);
+		int cred_ret = tls_credential_get(VOICE_CA_TAG,
+						  TLS_CREDENTIAL_CA_CERTIFICATE,
+						  &probe, &probe_len);
+
+		if (cred_ret == -ENOENT) {
+			LOG_ERR("[C0] CA cert (tag %d) not in store — "
+				"re-adding now", VOICE_CA_TAG);
+			cred_ret = tls_credential_add(
+				VOICE_CA_TAG,
+				TLS_CREDENTIAL_CA_CERTIFICATE,
+				server_ca_cert,
+				sizeof(server_ca_cert));
+			if (cred_ret < 0) {
+				LOG_ERR("[C0] re-add failed: %d", cred_ret);
+				zsock_close(sock);
+				zsock_freeaddrinfo(res);
+				return cred_ret;
+			}
+			LOG_INF("[C0] CA cert re-added (tag %d)", VOICE_CA_TAG);
+		} else {
+			LOG_INF("[C0] CA cert (tag %d) present in store", VOICE_CA_TAG);
+		}
 	}
 
 	LOG_INF("[C0] Connecting to %s:%d (TLS)...",
@@ -191,6 +257,11 @@ static int ws_connect_and_run(void)
 	ws_fd     = -1;
 	connected = false;
 	websocket_disconnect(wfd);
+	/* websocket_disconnect only closes the WS fd; the underlying TLS socket
+	 * (ctx->real_sock) is not closed by the websocket layer.  Close it
+	 * explicitly so the single TLS context slot is freed before the next
+	 * connect attempt. */
+	zsock_close(tcp_sock);
 	return -EIO;
 }
 
@@ -223,6 +294,19 @@ static void net_thread_fn(void *a, void *b, void *c)
 
 void net_thread_start(void)
 {
+	/* Register the pinned server CA cert once at startup.
+	 * sizeof() includes the null terminator which mbedTLS expects. */
+	int ret = tls_credential_add(VOICE_CA_TAG,
+				     TLS_CREDENTIAL_CA_CERTIFICATE,
+				     server_ca_cert,
+				     sizeof(server_ca_cert));
+
+	if (ret < 0 && ret != -EEXIST) {
+		LOG_ERR("[C0] Failed to register CA cert: %d", ret);
+	} else {
+		LOG_INF("[C0] CA cert registered (tag %d)", VOICE_CA_TAG);
+	}
+
 	k_thread_create(&net_thread_data,
 			(k_thread_stack_t *)net_stack_mem, NET_STACK_SIZE,
 			net_thread_fn, NULL, NULL, NULL,

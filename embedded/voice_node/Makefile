@@ -7,7 +7,7 @@ APPCPU_OVERLAY := $(CURDIR)/overlays/appcpu.overlay
 .PHONY: all clean flash menuconfig
 
 all:
-	west build --sysbuild -d $(BUILD) -b $(BOARD) procpu \
+	west build --sysbuild -d $(BUILD) -b $(BOARD) procpu --pristine \
 		-- -DDTC_OVERLAY_FILE=$(PROCPU_OVERLAY) \
 		   -Dvoice_node_appcpu_DTC_OVERLAY_FILE=$(APPCPU_OVERLAY)
 

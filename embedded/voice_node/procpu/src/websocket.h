@@ -5,11 +5,16 @@
 #include <stdbool.h>
 
 /* ── Server coordinates ────────────────────────────────────────────────────
- * Override in prj.conf (or credentials.conf) if vulcan.local mDNS does not
- * resolve — set VOICE_SERVER_HOST to the server's LAN IP instead.
+ * VOICE_SERVER_HOST     — DNS name used for TCP connection (resolved via router).
+ * VOICE_SERVER_TLS_HOST — hostname sent in TLS SNI; must match the CN/SAN in
+ *                         server_cert.h ("vulcan.local").
+ * Override either in credentials.conf if your setup differs.
  */
 #ifndef VOICE_SERVER_HOST
-#define VOICE_SERVER_HOST  "vulcan.local"
+#define VOICE_SERVER_HOST      "vulcan"
+#endif
+#ifndef VOICE_SERVER_TLS_HOST
+#define VOICE_SERVER_TLS_HOST  "vulcan.local"
 #endif
 #ifndef VOICE_SERVER_PORT
 #define VOICE_SERVER_PORT  443

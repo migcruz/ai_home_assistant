@@ -94,12 +94,19 @@ CONFIG_NET_SOCKETS=y
 CONFIG_DNS_RESOLVER=y
 CONFIG_NET_DHCPV4=y
 CONFIG_MDNS_RESOLVER=y            # resolves vulcan.local on the LAN
+CONFIG_DNS_SERVER_IP_ADDRESSES=y
+CONFIG_DNS_SERVER1="10.0.0.1"    # Zephyr DNS resolver does NOT pick up the nameserver from DHCP; must be static
 
 # ── TLS ───────────────────────────────────────────────────────────────────────
 CONFIG_MBEDTLS=y
 CONFIG_NET_SOCKETS_SOCKOPT_TLS=y
 CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS=1   # default was 4; we open exactly 1 session
 CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096 # reduced from 16KB; voice frames are small
+CONFIG_TLS_CREDENTIALS=y               # NOT auto-selected by SOCKOPT_TLS in Zephyr 4.3 (uses imply, not select)
+CONFIG_MBEDTLS_PEM_CERTIFICATE_FORMAT=y # required for PEM cert parsing; without this setsockopt(TLS_SEC_TAG_LIST) returns EINVAL
+CONFIG_MBEDTLS_ENABLE_HEAP=y
+CONFIG_MBEDTLS_HEAP_SIZE=60000
+CONFIG_MBEDTLS_HEAP_CUSTOM_SECTION=y   # places 60KB heap in PSRAM — linker has KEEP(*(.mbedtls_heap*)) in .ext_ram.data
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 CONFIG_WEBSOCKET_CLIENT=y
@@ -121,7 +128,7 @@ CONFIG_NET_L2_WIFI_SHELL=y        # wifi connect/status/scan
 CONFIG_HEAP_MEM_POOL_SIZE=45336           # Zephyr-enforced floor; cannot go lower
 CONFIG_NET_PKT_RX_COUNT=2                 # down from 4; single WS connection only
 CONFIG_NET_PKT_TX_COUNT=2
-CONFIG_NET_MAX_CONN=2
+CONFIG_NET_MAX_CONN=4              # DHCP (1) + DNS (1) + TCP WebSocket (1) + headroom (1); conn table shared by all bound sockets
 CONFIG_SHELL_BACKEND_SERIAL_TX_RING_BUFFER_SIZE=512  # down from 2048
 CONFIG_ESP32_TIMER_TASK_STACK_SIZE=2048              # down from 4096
 CONFIG_LOG_BUFFER_SIZE=512                           # down from 1024
@@ -242,7 +249,20 @@ def transcribe(audio_bytes: bytes, fmt: str = "webm") -> str:
 
 ### 5.4 TLS Certificate
 
-The server uses a self-signed certificate. For LAN-only use, the device sets `MBEDTLS_SSL_VERIFY_NONE`. Alternatively, the self-signed certificate can be burned into device flash and trusted explicitly.
+The server uses a self-signed certificate (CN=vulcan.local, RSA 2048, valid 2026–2036). The device uses **certificate pinning**: the server's public certificate is compiled into firmware as `server_cert.h` and registered with `tls_credential_add()` at startup. `TLS_PEER_VERIFY_REQUIRED` is set, so the TLS handshake will fail if the server's certificate does not match the pinned one.
+
+The pinned file contains only the **public certificate** — no private key. It is safe to commit to a public repository (TLS clients receive the certificate in the clear during the handshake anyway).
+
+Two hostname values are required because the cert was generated with CN=vulcan.local but DNS is resolved via the router by the short name:
+- `VOICE_SERVER_HOST="vulcan"` — used for DNS lookup (router knows "vulcan" from its DHCP table)
+- `VOICE_SERVER_TLS_HOST="vulcan.local"` — used for TLS SNI (must match the certificate's CN/SAN)
+
+To regenerate after renewing the server certificate:
+```bash
+echo | openssl s_client -connect localhost:443 2>/dev/null \
+  | openssl x509 -outform PEM
+# Replace the base64 lines in procpu/src/server_cert.h
+```
 
 ---
 
@@ -438,7 +458,7 @@ Each milestone is independently testable. Do not proceed to the next until the c
 |---|---|---|
 | **0 — Scaffold** | Both cores boot (AMP sysbuild); procpu blinks LED + runs shell; appcpu forwards heartbeat logs to procpu via IPM; both visible on `/dev/ttyACM0` | **Done** |
 | **1 — PDM capture** | Interrupt-driven BOOT button → IPM cmd → appcpu PDM→PSRAM via I2S DMA → cache flush → IPM done → procpu validates sample log | **Done** |
-| **2 — Network** | WiFi connects (via shell); TLS handshake (VERIFY_NONE); WebSocket opens to server; config message sent; recv loop running | **Done** |
+| **2 — Network** | WiFi connects (via shell); TLS handshake with pinned self-signed cert; WebSocket opens to server; config message sent; recv loop running; auto-reconnect on server close | **Done** |
 | **3 — Mic → Server** | WAV framing from PSRAM (strip right channel, mono); binary WebSocket stream; server transcribes correctly | — |
 | **4 — Server → Speaker** | Receive binary WAV frames; I2S playback through MAX98357A at 22050Hz | — |
 | **5 — Full round-trip** | Button-triggered (not wake word yet): speak → hear response end-to-end | — |
@@ -452,7 +472,7 @@ Each milestone is independently testable. Do not proceed to the next until the c
 
 | Question | Notes |
 |---|---|
-| Zephyr ESP32S3 WiFi stability | WiFi, DHCP, TLS handshake (VERIFY_NONE), and WebSocket open all confirmed working on hardware (Milestone 2 done). Long-term reconnect resilience not yet stress-tested. |
+| Zephyr ESP32S3 WiFi stability | WiFi, DHCP, TLS handshake (cert pinning), and WebSocket open + auto-reconnect all confirmed working on hardware (Milestone 2 done). Long-term reconnect resilience not yet stress-tested. |
 | I2S @ 22050Hz | Non-power-of-two sample rate. Supported on ESP32S3 but verify Zephyr I2S driver handles it correctly with the clock configuration for MAX98357A. |
 | Wake word false positive rate | TFLite Micro models may trigger occasionally in a noisy room. Tune threshold; consider dedicated IC if unacceptable. |
 | VAD sensitivity | Energy-based VAD may cut off trailing words in a quiet room or fail to detect silence in a noisy one. May need tuning or a lightweight VAD model. |

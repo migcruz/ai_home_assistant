@@ -31,10 +31,7 @@ This explains every symptom:
 
 After rebuilding, `APPREC.WAV` on SD card has clear audio.
 
-**Important**: If procpu's flash rodata size changes significantly (e.g., adding large const arrays or new libraries), `_ext_ram_start` may shift. After such changes, verify the address:
-```
-grep audio_psram_buf build/procpu/zephyr/zephyr_final.map
-```
+~~**Important**: If procpu's flash rodata size changes significantly, `_ext_ram_start` may shift — this is now handled dynamically via IPM (see below).~~
 
 ## ESP32-S3 PSRAM Address Map (for reference)
 
@@ -50,6 +47,31 @@ grep audio_psram_buf build/procpu/zephyr/zephyr_final.map
            | (unmapped)            |
 0x3C800000 +-----------------------+  End of 8MB PSRAM address window
 ```
+
+## Runtime Address Negotiation via IPM (2026-03-16)
+
+The hardcoded `AUDIO_PSRAM_BASE` address in `appcpu/src/pdm.h` is fragile — if flash rodata grows enough to cross a page boundary, `_ext_ram_start` shifts and the two images would disagree on the buffer location.
+
+**Fix**: procpu sends the actual runtime address of `audio_psram_buf` to appcpu at startup via IPM ID=3.
+
+Sequence:
+1. appcpu registers its IPM callback **before** its 1500ms startup sleep, so it's ready to receive early messages.
+2. procpu (~500ms after boot) sends `(uint32_t)audio_psram_buf` on IPM ID=3 right after IPM is initialized.
+3. appcpu waits up to 5s for the address, then calls `pdm_set_audio_buf(addr)` before `pdm_init`.
+4. If the message never arrives (e.g. during early bringup), appcpu falls back to `AUDIO_PSRAM_BASE` in `pdm.h` with a warning log.
+
+Log confirmation:
+```
+[C0] sent audio buf addr 0x3C0B0000 to appcpu
+[C1] audio buf addr: 0x3C0B0000
+```
+
+Files changed:
+- `appcpu/src/pdm.h` — added `pdm_set_audio_buf(uint32_t addr)`
+- `appcpu/src/pdm.c` — `audio_buf` is now a non-const pointer, set via `pdm_set_audio_buf()`
+- `appcpu/src/main.c` — early callback registration, wait loop, `pdm_set_audio_buf()` call
+- `procpu/src/main.c` — sends `IPM_ID_BUFADDR` (ID=3) after IPM init
+- Both `main.c` headers updated with ID=3 in the IPM message table
 
 ## Changes Already Made (Firmware + Debugging)
 

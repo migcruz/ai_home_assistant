@@ -5,6 +5,12 @@ import numpy as np
 import soundfile as sf
 from faster_whisper import WhisperModel
 
+try:
+    import torch as _torch
+    _has_torch = True
+except ImportError:
+    _has_torch = False
+
 _model: WhisperModel | None = None
 
 
@@ -25,17 +31,26 @@ def load_model() -> WhisperModel:
 def transcribe(audio_bytes: bytes) -> str:
     model = load_model()
 
-    # Write to a temp file — faster-whisper needs a file path or numpy array
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+    # Auto-detect format from magic bytes: WAV files start with "RIFF".
+    suffix = ".wav" if audio_bytes[:4] == b"RIFF" else ".webm"
+
+    # DEBUG: save a copy so it can be pulled from the container for listening.
+    # Remove once mic quality is confirmed.
+    # with open("/tmp/last_audio" + suffix, "wb") as dbg:
+    #     dbg.write(audio_bytes)
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
     try:
+        if _has_torch:
+            _torch.cuda.empty_cache()
         segments, _ = model.transcribe(
             tmp_path,
             language="en",
             beam_size=5,
-            vad_filter=True,               # skip silent segments
+            vad_filter=True, # skip silent segments
             vad_parameters={"min_silence_duration_ms": 500},
         )
         return " ".join(seg.text.strip() for seg in segments).strip()

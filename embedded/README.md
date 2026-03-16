@@ -47,11 +47,16 @@ All builds happen inside a Dev Container; flashing runs in the dev container as 
     ├── .devcontainer/
     │   ├── Dockerfile       ← zephyr-build + SDK 0.17.4 (all toolchains)
     │   └── devcontainer.json
-    └── voice_node/          ← voice firmware (AMP: procpu + appcpu)
+    ├── voice_node/          ← voice firmware (AMP: procpu + appcpu)
+    │   ├── Makefile
+    │   ├── overlays/        ← explicit DTS overlays for both cores
+    │   ├── procpu/          ← Core 0 image (WiFi, WebSocket, button, shell)
+    │   └── appcpu/          ← Core 1 image (PDM mic capture)
+    └── testapp_mic/             ← standalone PDM capture debug app
         ├── Makefile
-        ├── overlays/        ← explicit DTS overlays for both cores
-        ├── procpu/          ← Core 0 image (WiFi, WebSocket, button, shell)
-        └── appcpu/          ← Core 1 image (PDM mic capture)
+        ├── testapp_mic.overlay  ← Arduino-equivalent pins: CLK=42, DATA=41
+        ├── prj.conf
+        └── src/main.c
 ```
 
 ---

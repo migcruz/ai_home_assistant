@@ -70,7 +70,7 @@ XIAO ESP32S3       MAX98357A
 
 ### 2.2 Key Kconfig Settings
 
-**procpu/prj.conf** (Core 0 — networking, audio I/O, shell):
+**procpu/prj.conf** (Core 0 — networking, SD/WAV debug, audio I/O, shell):
 
 ```kconfig
 # ── IPC ───────────────────────────────────────────────────────────────────────
@@ -93,15 +93,14 @@ CONFIG_NET_TCP=y
 CONFIG_NET_SOCKETS=y
 CONFIG_DNS_RESOLVER=y
 CONFIG_NET_DHCPV4=y
-CONFIG_MDNS_RESOLVER=y            # resolves vulcan.local on the LAN
 CONFIG_DNS_SERVER_IP_ADDRESSES=y
-CONFIG_DNS_SERVER1="10.0.0.1"    # Zephyr DNS resolver does NOT pick up the nameserver from DHCP; must be static
+CONFIG_DNS_SERVER1="10.0.0.1"    # Zephyr DNS resolver does NOT pick up nameserver from DHCP; must be static
 
 # ── TLS ───────────────────────────────────────────────────────────────────────
 CONFIG_MBEDTLS=y
 CONFIG_NET_SOCKETS_SOCKOPT_TLS=y
 CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS=1   # default was 4; we open exactly 1 session
-CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096 # reduced from 16KB; voice frames are small
+CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096 # reduced from 16KB; chunked WAV sends are ≤4096 bytes
 CONFIG_TLS_CREDENTIALS=y               # NOT auto-selected by SOCKOPT_TLS in Zephyr 4.3 (uses imply, not select)
 CONFIG_MBEDTLS_PEM_CERTIFICATE_FORMAT=y # required for PEM cert parsing; without this setsockopt(TLS_SEC_TAG_LIST) returns EINVAL
 CONFIG_MBEDTLS_ENABLE_HEAP=y
@@ -118,24 +117,36 @@ CONFIG_FLASH_MAP=y
 CONFIG_FILE_SYSTEM=y
 CONFIG_FILE_SYSTEM_LITTLEFS=y
 
+# ── SD/FAT — debug WAV dump after audio capture ───────────────────────────────
+CONFIG_SPI=y
+CONFIG_DISK_ACCESS=y
+CONFIG_FAT_FILESYSTEM_ELM=y
+CONFIG_FS_FATFS_CUSTOM_MOUNT_POINT_COUNT=1
+CONFIG_FS_FATFS_CUSTOM_MOUNT_POINTS="SD"
+CONFIG_FS_FATFS_NUM_FILES=1      # saves ~1.6KB vs default 4; we open at most 1 file at a time
+CONFIG_FS_FATFS_NUM_DIRS=1       # saves ~252B vs default 4
+
 # ── Shell (development) ───────────────────────────────────────────────────────
 CONFIG_SHELL=y
 CONFIG_SHELL_BACKEND_SERIAL=y
 CONFIG_NET_SHELL=y
 CONFIG_NET_L2_WIFI_SHELL=y        # wifi connect/status/scan
 
-# ── DRAM budget tuning (185KB DRAM, 99.7% used — very tight) ─────────────────
+# ── DRAM budget tuning (185KB DRAM, ~99.7% used — very tight) ────────────────
 CONFIG_HEAP_MEM_POOL_SIZE=45336           # Zephyr-enforced floor; cannot go lower
-CONFIG_NET_PKT_RX_COUNT=2                 # down from 4; single WS connection only
+CONFIG_NET_PKT_RX_COUNT=3                 # 2 caused WS stalls: TCP ACKs starved RX slots during audio sends
+CONFIG_NET_BUF_RX_COUNT=32               # pinned to prevent auto-scaling when RX_COUNT increased
 CONFIG_NET_PKT_TX_COUNT=2
-CONFIG_NET_MAX_CONN=4              # DHCP (1) + DNS (1) + TCP WebSocket (1) + headroom (1); conn table shared by all bound sockets
+CONFIG_NET_MAX_CONN=4              # DHCP (1) + DNS (1) + TCP WebSocket (1) + headroom (1)
+CONFIG_MAIN_STACK_SIZE=4096        # SD write and WS send are sequential (not nested) — max(FatFS, TLS/WS)
+CONFIG_NET_MGMT_EVENT_STACK_SIZE=1024    # default 2048; our callback only sets semaphore + logs
 CONFIG_SHELL_BACKEND_SERIAL_TX_RING_BUFFER_SIZE=512  # down from 2048
 CONFIG_ESP32_TIMER_TASK_STACK_SIZE=2048              # down from 4096
 CONFIG_LOG_BUFFER_SIZE=512                           # down from 1024
 # net_thread stack (16KB) placed in PSRAM via __attribute__((section(".ext_ram.bss")))
 ```
 
-**appcpu/prj.conf** (Core 1 — wake word, VAD, mic capture):
+**appcpu/prj.conf** (Core 1 — mic capture; future: wake word, VAD):
 
 ```kconfig
 # ── IPC ───────────────────────────────────────────────────────────────────────
@@ -143,12 +154,11 @@ CONFIG_IPM=y                      # sends events + log strings to procpu
 
 # ── PDM microphone ────────────────────────────────────────────────────────────
 CONFIG_I2S=y
-
-# ── Wake word ─────────────────────────────────────────────────────────────────
-CONFIG_TENSORFLOW_LITE_MICRO=y
+CONFIG_DMA=y
 
 # No shell, no log backend UART — appcpu has no console.
 # Log strings are forwarded to procpu via IPM and printed with [C1] prefix.
+# No SD/FAT — debug WAV writes have been moved to procpu.
 ```
 
 ---
@@ -336,36 +346,38 @@ embedded/
 ├── west.yml                # pins Zephyr v4.3.0
 ├── README.md
 └── voice_node/
-    ├── Makefile             # sysbuild wrappers (make / make flash / make menuconfig)
+    ├── Makefile             # sysbuild wrappers (make / make flash / make menuconfig / make clean)
+    ├── README.md
     ├── specs/
     │   ├── functional-spec.md
     │   ├── design-spec.md
     │   └── technical-spec.md
-    ├── procpu/              # PRO CPU image (Core 0) — networking, audio I/O, shell
-    │   ├── CMakeLists.txt
-    │   ├── prj.conf         # Kconfig: IPM, WiFi, TLS, WebSocket, I2S, BLE, shell
+    ├── overlays/            # DTS overlays passed via -DDTC_OVERLAY_FILE
+    │   ├── procpu.overlay   # ipm0, BOOT button, SD card (SPI2: GPIO7/8/9, CS=GPIO21)
+    │   └── appcpu.overlay   # ipm0, USB serial, DMA, I2S0 PDM pinctrl (GPIO42 CLK, GPIO41 DATA)
+    ├── common/              # shared headers and drivers included by both images
+    │   ├── audio_shared.h   # struct audio_shared (magic, byte_count, sample_rate, channels, bits, pcm[])
+    │   ├── ipm_ids.h        # IPM message ID constants — single source of truth
+    │   ├── sd_wav.h         # sd_wav_write() API
+    │   └── sd_wav.c         # FAT/SD WAV writer; FATFS in PSRAM (.ext_ram.bss)
+    ├── procpu/              # PRO CPU image (Core 0) — networking, WAV send, SD debug, shell
+    │   ├── CMakeLists.txt   # includes ../common/sd_wav.c
+    │   ├── prj.conf         # Kconfig: IPM, WiFi, TLS, WebSocket, SD/FAT, shell
     │   ├── sysbuild.cmake   # registers appcpu as remote image; sets build order
     │   ├── credentials.conf # gitignored — WiFi SSID/PSK for prototype builds
-    │   ├── socs/
-    │   │   └── esp32s3_procpu_sense.overlay  # enables ipm0 for procpu
     │   └── src/
-    │       ├── main.c           # entry point, IPM receive, state machine
-    │       ├── storage.c        # LittleFS mount + credential read/write
-    │       ├── wifi.c           # WiFi connect + reconnect
-    │       ├── provisioning.c   # BLE GATT provisioning
-    │       ├── websocket.c      # WebSocket client + protocol framing
-    │       ├── audio_capture.c  # PDM mic → PCM → WAV framing
-    │       ├── audio_playback.c # WAV frame receive → I2S output
-    │       └── chime.c          # acknowledgement and error chimes
-    └── appcpu/              # APP CPU image (Core 1) — wake word, VAD, mic capture
+    │       ├── main.c       # IPM receive loop, send_audio_as_wav(), LED blink
+    │       ├── storage.c    # LittleFS mount + credential read/write
+    │       ├── button.c/h   # BOOT button GPIO interrupt → k_work → IPM CMD
+    │       ├── audio.c/h    # audio_psram_buf in .ext_ram.bss; exports address to appcpu
+    │       ├── wifi.c/h     # WiFi connect + net_mgmt reconnect
+    │       └── websocket.c/h  # TLS WebSocket client, ws_send_binary/text, net_thread
+    └── appcpu/              # APP CPU image (Core 1) — PDM capture; future: wake word, VAD
         ├── CMakeLists.txt
-        ├── prj.conf         # Kconfig: IPM, I2S, TFLite Micro — no shell/log backend
-        ├── boards/
-        │   └── xiao_esp32s3_appcpu.overlay  # enables ipm0; console → usb_serial (unused)
+        ├── prj.conf         # Kconfig: IPM, I2S, DMA, PSRAM — no shell/log backend/SD
         └── src/
-            ├── main.c       # entry point; ipm_log() forwards strings to procpu via IPM
-            ├── wake_word.c  # TFLite Micro inference loop; sends wake event via IPM
-            └── vad.c        # RMS-based voice activity detection; sends end-of-speech via IPM
+            ├── main.c       # IPM handlers; PSRAM address negotiation (IPM ID=3); PDM trigger
+            └── pdm.c/h      # I2S PDM init, per-block mono strip, cache flush, IPM done
 ```
 
 **Flash layout** (4MB, `partitions_0x0_amp.dtsi`):
@@ -459,7 +471,7 @@ Each milestone is independently testable. Do not proceed to the next until the c
 | **0 — Scaffold** | Both cores boot (AMP sysbuild); procpu blinks LED + runs shell; appcpu forwards heartbeat logs to procpu via IPM; both visible on `/dev/ttyACM0` | **Done** |
 | **1 — PDM capture** | Interrupt-driven BOOT button → IPM cmd → appcpu PDM→PSRAM via I2S DMA → cache flush → IPM done → procpu validates sample log | **Done** |
 | **2 — Network** | WiFi connects (via shell); TLS handshake with pinned self-signed cert; WebSocket opens to server; config message sent; recv loop running; auto-reconnect on server close | **Done** |
-| **3 — Mic → Server** | WAV framing from PSRAM (strip right channel, mono); binary WebSocket stream; server transcribes correctly | — |
+| **3 — Mic → Server** | WAV framing from PSRAM (strip right channel, mono); binary WebSocket stream; server transcribes correctly | **Done** |
 | **4 — Server → Speaker** | Receive binary WAV frames; I2S playback through MAX98357A at 22050Hz | — |
 | **5 — Full round-trip** | Button-triggered (not wake word yet): speak → hear response end-to-end | — |
 | **6 — Wake word** | Integrate TFLite Micro model on appcpu; replace button press with keyword detection | — |

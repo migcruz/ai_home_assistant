@@ -74,7 +74,8 @@ Current IPM message IDs:
 |---|---|---|---|
 | 0 | appcpu → procpu | `char[]` log string | Forward appcpu log lines; procpu prints with `[C1]` prefix |
 | 1 | procpu → appcpu | `uint8_t` (1=start, 0=stop) | BOOT button press/release → start/stop PDM capture |
-| 2 | appcpu → procpu | `uint32_t` byte_count | PDM capture complete; procpu reads PSRAM audio buffer |
+| 2 | appcpu → procpu | `uint8_t` done signal | PDM capture complete; byte count lives in `struct audio_shared` in PSRAM |
+| 3 | procpu → appcpu | `uint32_t` address | PSRAM buffer address (`audio_psram_buf`) — sent at startup so both cores agree |
 
 Future IDs will carry wake word events and end-of-speech signals once TFLite Micro and VAD are added.
 
@@ -127,23 +128,30 @@ embedded/voice_node/
 │   ├── design-spec.md           # architecture, state machine, audio flows
 │   └── technical-spec.md        # BOM, Kconfig, flash layout, build commands
 ├── overlays/                    # DTS overlays passed explicitly via -DDTC_OVERLAY_FILE
-│   ├── procpu.overlay           # ipm0 enable, BOOT button (GPIO0, sw0 alias)
-│   └── appcpu.overlay           # ipm0, DMA, I2S0 PDM pinctrl (GPIO41 CLK, GPIO42 DATA)
+│   ├── procpu.overlay           # ipm0, BOOT button, SD card (SPI2, GPIO7-9/21)
+│   └── appcpu.overlay           # ipm0, USB serial, DMA, I2S0 PDM pinctrl (GPIO42 CLK, GPIO41 DATA)
+├── common/                      # shared headers and drivers — included by both images
+│   ├── audio_shared.h           # struct audio_shared, AUDIO_BUF_MAX, AUDIO_SAMPLE_RATE, etc.
+│   ├── ipm_ids.h                # IPM message ID constants (single source of truth)
+│   ├── sd_wav.h                 # sd_wav_write() API
+│   └── sd_wav.c                 # FAT/SD WAV writer; FATFS placed in PSRAM (.ext_ram.bss)
 ├── procpu/                      # PRO CPU image (Core 0)
-│   ├── CMakeLists.txt
+│   ├── CMakeLists.txt           # includes ../common/sd_wav.c
 │   ├── sysbuild.cmake           # registers appcpu as remote image
-│   ├── prj.conf                 # Kconfig: IPM, WiFi, TLS, WebSocket, I2S, shell
+│   ├── prj.conf                 # Kconfig: IPM, WiFi, TLS, WebSocket, SD/FAT, shell
 │   └── src/
-│       ├── main.c               # entry point, IPM receive, blink loop
+│       ├── main.c               # send_audio_as_wav (reads audio_shared), LED blink loop
 │       ├── storage.c            # LittleFS mount + credential read/write
 │       ├── button.c/h           # BOOT button: GPIO interrupt → k_work → IPM CMD
-│       └── audio.c/h            # PSRAM pointer, cache invalidate, log_audio_samples()
+│       ├── audio.c/h            # audio_psram_buf in .ext_ram.bss, PSRAM address export
+│       ├── wifi.c/h             # WiFi connect + reconnect
+│       └── websocket.c/h        # TLS WebSocket client, ws_send_binary/text
 └── appcpu/                      # APP CPU image (Core 1)
     ├── CMakeLists.txt
-    ├── prj.conf                 # Kconfig: IPM, DMA, I2S, PSRAM (OPI)
+    ├── prj.conf                 # Kconfig: IPM, DMA, I2S, PSRAM (OPI) — no SD/shell
     └── src/
-        ├── main.c               # entry point, IPM command handler, orchestration
-        └── pdm.c/h              # I2S PDM init, DMA slab, pdm_record(), cache flush
+        ├── main.c               # IPM cmd handler, PSRAM address negotiation (IPM ID=3)
+        └── pdm.c/h              # I2S PDM init, per-block mono strip, cache flush
 ```
 
 ---
@@ -183,6 +191,18 @@ make menuconfig         # interactive Kconfig (procpu image)
 make flash              # west flash -d build
 ```
 
+If the PDM mic is only producing static, try the alternate pin mapping overlay:
+
+```bash
+make APPCPU_OVERLAY=overlays/appcpu_gpio42_clk_gpio41_data.overlay
+```
+
+If it is still static, try driving the PDM clock on `WS` (ESP-IDF-style PDM):
+
+```bash
+make APPCPU_OVERLAY=overlays/appcpu_gpio42_ws_clk_gpio41_data.overlay
+```
+
 For prototype builds with hardcoded WiFi credentials, create `procpu/credentials.conf` (gitignored):
 
 ```kconfig
@@ -214,8 +234,9 @@ Shell prompt: `uart:~$`. Both cores' log output appears here — procpu logs are
 - **Server-side STT/LLM/TTS** — Whisper, Ollama, and Piper run on the server. The device only streams raw audio and plays back WAV. This keeps firmware complexity low and lets the server be upgraded independently.
 - **No persistent WebSocket** — The connection opens on wake and closes after playback drains. Idle state carries no open socket, which simplifies reconnection and reduces power draw.
 - **OPI PSRAM** — The XIAO ESP32S3 uses Octal PSRAM. `CONFIG_SPIRAM_MODE_OCT=y` is required; the default Quad mode causes a boot crash.
-- **I2S DMA always stereo** — The ESP32-S3 I2S DMA controller only operates in stereo (`channels=2`); `channels=1` is rejected with `EINVAL`. The mono PDM mic outputs on the left channel; the right channel carries zeros. WAV streaming strips alternate samples before sending.
-- **PSRAM cache coherency** — Both cores access PSRAM through independent L1 data caches with no hardware coherency. After `pdm_record()` writes the capture buffer, appcpu calls `sys_cache_data_flush_range()` before sending the IPM done signal. procpu calls `sys_cache_data_invd_range()` before reading, ensuring it sees appcpu's data rather than its own stale cache lines.
+- **I2S DMA always stereo** — The ESP32-S3 I2S DMA controller only operates in stereo (`channels=2`); `channels=1` is rejected with `EINVAL`. The mono PDM mic outputs on the left channel; the right channel carries zeros. Mono conversion (keep every even sample) happens per-block inside `pdm_record()` on appcpu — the PSRAM buffer contains mono PCM by the time procpu reads it.
+- **PSRAM cache coherency** — Both cores access PSRAM through independent L1 data caches with no hardware coherency. appcpu writes `struct audio_shared` (header + mono PCM) to PSRAM and calls `sys_cache_data_flush_range()` before sending the IPM done signal. procpu calls `sys_cache_data_invd_range()` on the header, reads `shdr->byte_count`, then invalidates the PCM range before streaming.
+- **Single source of truth via `struct audio_shared`** — The PSRAM buffer starts with a self-describing header (`magic`, `byte_count`, `sample_rate`, `channels`, `bits`) followed by a flexible array member `pcm[]`. The IPM done signal is a 1-byte notification only; procpu reads all metadata from the struct, eliminating the need to pass `byte_count` over IPM.
 
 ---
 

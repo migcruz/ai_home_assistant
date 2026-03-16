@@ -25,16 +25,24 @@
 
 /*
  * PDM microphone — MSM261S4030H0R (built into XIAO ESP32S3 Sense)
- *   CLK  GPIO41 → I2S0_I_BCK (output from ESP32, drives mic clock)
+ *   CLK  GPIO41 → I2S0_O_BCK (bit clock output, PDM clock)
  *   DATA GPIO42 → I2S0_I_SD  (input to ESP32, PDM data from mic)
  *
- * NOTE: if PDM clock/data are swapped at runtime, swap GPIO41 ↔ GPIO42 here.
+ * NOTE: If you get full-scale noise, these may be swapped on your board
+ * revision. This overlay is the "GPIO41=CLK, GPIO42=DATA" variant.
+ *
+ * Pull-down on DATA (GPIO41): mono mic tri-states during CLK HIGH.
+ * Pull-down holds the line LOW, making R-channel → near-zero DC.
  */
 &pinctrl {
 	i2s0_pdm_rx_default: i2s0_pdm_rx_default {
 		group1 {
-			pinmux = <I2S0_I_BCK_GPIO41>,
-				 <I2S0_I_SD_GPIO42>;
+			/* Use O_* clock outputs (master mode). */
+			pinmux = <I2S0_I_WS_GPIO42>;
+		};
+		group2 {
+			pinmux = <I2S0_I_SD_GPIO41>;
+			bias-pull-down;
 		};
 	};
 };

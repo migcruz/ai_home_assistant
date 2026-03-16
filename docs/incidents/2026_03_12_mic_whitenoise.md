@@ -85,13 +85,23 @@ In `embedded/voice_node/appcpu/src/pdm.c`:
 - Per-block mono conversion in recording loop: extracts left channel from stereo DMA blocks, writes to PSRAM.
 - Post-loop SD WAV write via DRAM bounce buffer (SD SPI DMA may not read correctly from PSRAM cache-mapped addresses).
 
-### WAV creation + DC offset removal (procpu)
+### Shared buffer layout (common/audio_shared.h)
 
-In `embedded/voice_node/procpu/src/main.c`:
+`struct audio_shared` with a flexible array member `uint8_t pcm[]` is allocated by procpu in `.ext_ram.bss` and its address is sent to appcpu at startup via IPM ID=3. Both cores work from the same struct:
 
-- Builds WAV header, streams mono PCM to voice service via WebSocket.
-- Auto-selects L/R slot based on mid-buffer amplitude.
-- DC offset removal via mean subtraction.
+```c
+struct audio_shared { uint32_t magic; uint32_t byte_count; uint32_t sample_rate;
+                      uint16_t channels; uint16_t bits; uint8_t pcm[]; };
+```
+
+`shdr->byte_count` is the single source of truth for how many mono PCM bytes were captured. The IPM ID=2 "done" signal carries no data — procpu reads everything from the struct.
+
+### WAV streaming (procpu/src/main.c)
+
+- Invalidates procpu cache in two steps: header first (to read `byte_count`), then `shdr->pcm`.
+- Sends 44-byte WAV header via WebSocket, then streams `shdr->pcm` in 4096-byte chunks (matching `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN`).
+- No DC offset removal — Whisper normalises the audio internally; DC offset did not affect recognition.
+- No stereo-strip on procpu — mono conversion is done per-block on appcpu during capture.
 
 ### Overlay alignment
 
@@ -99,8 +109,6 @@ In `embedded/voice_node/procpu/src/main.c`:
 - `I2S0_I_WS_GPIO42` (PDM clock output)
 - `I2S0_I_SD_GPIO41` (PDM data input, with `bias-pull-down`)
 
-## Remaining Work
+## Resolution
 
-- **procpu stereo/mono mismatch**: `send_audio_as_wav()` in `procpu/src/main.c` still treats PSRAM data as stereo-interleaved (stride-2 access, `mono_bytes = byte_count / 2`). The data is already mono from appcpu. This needs to be fixed for the WebSocket path to work correctly.
-- Re-enable `vad_filter=True` in `services/voice/src/transcribe.py` once end-to-end path is verified.
-- Clean up diagnostic logging (`log_block_stats`, PSRAM readback, register dumps).
+**Milestone 3 complete (2026-03-16).** End-to-end path verified: button hold → PDM capture → PSRAM → WebSocket WAV stream → Whisper → LLM → TTS response received correctly. `log_block_stats` diagnostic commented out. `vad_filter=True` can be re-enabled in `services/voice/src/transcribe.py` when VAD quality has been validated on real recordings.

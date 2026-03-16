@@ -20,9 +20,22 @@ static const struct device  *ipm;
 
 static volatile bool recording = false;
 
-static void send_cmd(uint8_t cmd)
+static int send_cmd(uint8_t cmd)
 {
-	ipm_send(ipm, 1, IPM_ID_CMD, &cmd, sizeof(cmd));
+	/*
+	 * IPM mailbox is a single shared slot (no queue). Under heavy appcpu
+	 * logging, one-shot sends can fail transiently. Retry briefly so START/STOP
+	 * button edges are not lost.
+	 */
+	for (int attempt = 0; attempt < 20; attempt++) {
+		int ret = ipm_send(ipm, 1, IPM_ID_CMD, &cmd, sizeof(cmd));
+		if (ret == 0) {
+			return 0;
+		}
+		k_sleep(K_MSEC(5));
+	}
+
+	return -EIO;
 }
 
 static void btn_work_handler(struct k_work *work)
@@ -34,11 +47,15 @@ static void btn_work_handler(struct k_work *work)
 	if (pressed && !recording) {
 		recording = true;
 		LOG_INF("[C0] button pressed — sending START to appcpu");
-		send_cmd(CMD_START);
+		if (send_cmd(CMD_START) < 0) {
+			LOG_WRN("[C0] START send failed");
+		}
 	} else if (!pressed && recording) {
 		recording = false;
 		LOG_INF("[C0] button released — sending STOP to appcpu");
-		send_cmd(CMD_STOP);
+		if (send_cmd(CMD_STOP) < 0) {
+			LOG_WRN("[C0] STOP send failed");
+		}
 	}
 }
 

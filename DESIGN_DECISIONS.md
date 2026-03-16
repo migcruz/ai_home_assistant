@@ -35,6 +35,12 @@ A structured record of architectural choices made across the Home AI Assistant p
   - [Explicit DTS overlay paths](#explicit-dts-overlay-paths-not-zephyr-auto-discovery)
   - [PSRAM (8MB OPI) for audio buffers](#psram-8mb-opi-for-audio-buffers-and-networking-stack)
   - [WAV format for device ↔ server audio](#wav-format-for-device--server-audio)
+  - [`struct audio_shared` as single source of truth for audio metadata](#struct-audio_shared-as-single-source-of-truth-for-audio-metadata)
+  - [Mono conversion on appcpu per-block during capture (not on procpu before send)](#mono-conversion-on-appcpu-per-block-during-capture-not-on-procpu-before-send)
+  - [Runtime PSRAM buffer address sent via IPM ID=3 (not hardcoded)](#runtime-psram-buffer-address-sent-via-ipm-id3-not-hardcoded)
+  - [SD card debug write on procpu, not appcpu](#sd-card-debug-write-on-procpu-not-appcpu)
+  - [PCM sent in 4096-byte chunks (TLS record size boundary)](#pcm-sent-in-4096-byte-chunks-tls-record-size-boundary)
+  - [No DC offset removal in firmware](#no-dc-offset-removal-in-firmware)
   - [net_thread stack placed in PSRAM via `.ext_ram.bss`](#net_thread-stack-placed-in-psram-via-ext_rambss)
   - [`CONFIG_HEAP_MEM_POOL_SIZE` set to the Zephyr-enforced floor](#config_heap_mem_pool_size-set-to-the-zephyr-enforced-floor-45336-bytes)
   - [DRAM pool and buffer reductions to fit the 185KB budget](#dram-pool-and-buffer-reductions-to-fit-the-185kb-budget)
@@ -324,17 +330,21 @@ Kubernetes would add scheduler, etcd, and control plane overhead that is disprop
 | Config | Default → Value | Bytes freed | Rationale |
 |---|---|---|---|
 | `CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS` | 4 → 1 | ~3,792 | We open exactly 1 TLS session; 3 × 1,264-byte contexts wasted |
-| `CONFIG_NET_PKT_RX_COUNT` | 4 → 2 | ~2,304 | Single TCP/WS connection; 2 packet descriptors sufficient |
-| `CONFIG_NET_PKT_TX_COUNT` | 4 → 2 | ~2,304 | Same |
-| `CONFIG_NET_MAX_CONN` | 4 → 2 | small | Connection table |
+| `CONFIG_NET_PKT_RX_COUNT` | 4 → 3 | ~1,152 | Originally set to 2, but caused WS stalls: TCP ACKs were starved during sustained audio sends (net_work processing TX segments held both slots >100ms → ACK dropped → send window stalled). Raised to 3. |
+| `CONFIG_NET_PKT_TX_COUNT` | 4 → 2 | ~2,304 | Single outbound TCP stream |
+| `CONFIG_NET_MAX_CONN` | 4 → 4 | — | Kept at default: DHCP (1) + DNS (1) + TCP WebSocket (1) + headroom (1) |
 | `CONFIG_SHELL_BACKEND_SERIAL_TX_RING_BUFFER_SIZE` | 2,048 → 512 | 1,536 | Shell TX buffer; 512B is plenty for command echoes |
 | `CONFIG_ESP32_TIMER_TASK_STACK_SIZE` | 4,096 → 2,048 | 2,048 | ESP timer callbacks are simple; 2KB is sufficient |
 | `CONFIG_LOG_BUFFER_SIZE` | 1,024 → 512 | 512 | Logging ring buffer; risk: drops under burst logging at DEBUG level |
-| `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN` | 16,384 → 4,096 | runtime only | Per-connection TLS record buffer; voice frames are small JSON + WAV chunks |
+| `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN` | 16,384 → 4,096 | runtime only | Per-connection TLS record buffer; WAV PCM is chunked to match this limit |
+| `CONFIG_NET_MGMT_EVENT_STACK_SIZE` | 2,048 → 1,024 | 1,024 | net_mgmt callback only sets a semaphore + logs; 1KB is sufficient |
+| `CONFIG_FS_FATFS_NUM_FILES` | 4 → 1 | ~1,600 | We open at most one file at a time (debug WAV write) |
+| `CONFIG_FS_FATFS_NUM_DIRS` | 4 → 1 | ~252 | We never open a directory handle |
+| `FATFS` struct → `.ext_ram.bss` | on-chip → PSRAM | ~560 | `static FATFS sd_wav_fatfs __attribute__((section(".ext_ram.bss")))` |
 
-**Why:** After enabling WiFi + TLS + WebSocket, the DRAM segment overflowed by ~26KB. The reductions above, combined with the PSRAM stack move, brought DRAM usage to 184.4KB / 185KB (568 bytes headroom). The map file was the critical tool — it shows every `.dram0.bss` symbol with its size, making the largest controllable items visible. `NET_SOCKETS_TLS_MAX_CONTEXTS=4` was the single biggest surprise: the Zephyr default silently allocates four TLS context structs regardless of how many connections are actually opened.
+**Why:** After enabling WiFi + TLS + WebSocket, the DRAM segment overflowed by ~26KB. A second overflow of 5,768 bytes occurred when SD/FAT was moved to procpu (Milestone 3). The map file (`zephyr_pre0.map`) was the critical tool — it shows every `.dram0.bss` symbol with its size, making the largest controllable items visible. `NET_SOCKETS_TLS_MAX_CONTEXTS=4` was the single biggest surprise: the Zephyr default silently allocates four TLS context structs regardless of how many connections are actually opened.
 
-**Risk:** The 568-byte headroom means any new static global or increase to any pool size will cause a linker overflow. Future milestones (I2S playback, chime buffers) must allocate in PSRAM exclusively.
+**Risk:** DRAM is effectively at capacity. Any new static global or pool size increase will overflow. All future allocations must target PSRAM via `.ext_ram.bss`.
 
 ---
 
@@ -345,6 +355,68 @@ Kubernetes would add scheduler, etcd, and control plane overhead that is disprop
 **Alternatives:** Raw PCM (no header); opus; MP3; WebM (used by browser clients).
 
 **Why:** WAV is the simplest framed audio format — 44-byte header, then raw PCM. No codec complexity on an embedded device. The server can parse the sample rate from header bytes 24-27, which means the device can report the actual PDM capture rate without a separate signalling message. The response path uses WAV for the same reason: the device reads the sample rate from the WAV header to configure the I2S clock correctly for playback without any out-of-band coordination.
+
+---
+
+### `struct audio_shared` as single source of truth for audio metadata
+
+**Decision:** The PSRAM buffer starts with a self-describing header (`struct audio_shared`: `magic`, `byte_count`, `sample_rate`, `channels`, `bits`, followed by a flexible array member `uint8_t pcm[]`). The IPM ID=2 "done" signal is a 1-byte notification only — it carries no payload. procpu reads `byte_count` and all other metadata directly from the struct after invalidating its cache.
+
+**Alternatives:** Pass `byte_count` in the IPM ID=2 payload (4 bytes fits in the 1KB IPM slot); keep the hardcoded `AUDIO_SAMPLE_RATE` / `AUDIO_CHANNELS` / `AUDIO_BITS` constants as the shared truth.
+
+**Why:** Two sources of truth for the same fact diverge. If the appcpu ever changes sample rate or bit depth (for future VAD or TFLite tuning), and that change is not reflected in the constant, procpu builds a wrong WAV header silently. The struct carries all parameters alongside the data it describes — procpu cannot use the data without reading the parameters. The IPM payload was briefly used for `byte_count`, but this was redundant once the struct existed, and it required the procpu's IPM callback to stash the value into a global variable for later use. Removing it from the payload made the callback a pure signal handler (`audio_ready = true`) with no state to manage.
+
+---
+
+### Mono conversion on appcpu per-block during capture (not on procpu before send)
+
+**Decision:** During `pdm_record()`, appcpu strips the right channel (zeros from the PDM mono mic) per DMA block as audio arrives: for each stereo block from I2S, every even sample (left channel) is written to `shdr->pcm[]` in PSRAM. By the time the IPM done signal fires, PSRAM contains straight mono PCM. procpu sends it directly with no further processing.
+
+**Alternatives:** Store full stereo-interleaved PCM in PSRAM and strip on procpu before sending; strip on procpu using a PSRAM-resident temporary buffer; send stereo to the server (doubles bandwidth and server-side complexity).
+
+**Why:** Stripping on appcpu during capture means procpu's send path is a simple linear read — no stride, no PSRAM bounce buffer, no additional cache invalidation window. The PSRAM buffer is half the size (160KB mono vs 320KB stereo for 5s), which matters given the ~580KB total PSRAM budget. The per-block CPU cost on appcpu is negligible (a tight loop over ~1024 samples per block). Doing it on procpu would require either an in-place strip (modifying cache-dirty PSRAM from a second core — risky) or a PSRAM-backed destination buffer (extra 160KB). The appcpu approach avoids both problems and keeps procpu's role clean: read, frame, send.
+
+---
+
+### Runtime PSRAM buffer address sent via IPM ID=3 (not hardcoded)
+
+**Decision:** procpu sends `(uint32_t)(uintptr_t)audio_psram_buf` to appcpu via IPM ID=3 immediately after IPM is initialised. appcpu waits up to 5 seconds for the message, then calls `pdm_set_audio_buf(addr)`. If no message arrives (early bringup without procpu), appcpu falls back to the compile-time `AUDIO_PSRAM_BASE` constant with a warning.
+
+**Alternatives:** Hardcode `AUDIO_PSRAM_BASE` in both images (original approach); place the buffer at a fixed linker address using an absolute-address section; use a symbol exported via the ELF and baked into the appcpu image at link time.
+
+**Why:** The original hardcoded `AUDIO_PSRAM_BASE = 0x3C000000` pointed at flash-mapped rodata, not PSRAM. This was the root cause of the white noise issue: writes went into the CPU's write-back cache but could never persist to actual PSRAM (the backing storage is read-only flash). Reads during recording hit cached data and looked valid; after cache eviction, reads returned flash content — random bytes that sounded like white noise. The correct PSRAM address depends on how much flash rodata the linker emits for the `.ext_ram.dummy` skip region, which changes with every build if code or read-only data is added to procpu. The only stable source of truth is the runtime address of the symbol the linker actually placed. Sending it at boot via IPM makes the agreement dynamic and eliminates the fragility.
+
+---
+
+### SD card debug write on procpu, not appcpu
+
+**Decision:** The SD card (SPI2: GPIO7/8/9, CS=GPIO21) is wired to procpu's DT overlay. `sd_wav_write()` is called from `procpu/src/main.c` after the PSRAM cache is invalidated and the audio is already in hand. appcpu has no SD-related Kconfig, no SD DT nodes, and no `sd_wav.c` in its CMakeLists.
+
+**Alternatives:** SD on appcpu (original design) — appcpu writes a WAV to SD immediately after `pdm_record()` completes, before sending the IPM done signal; SD accessible from both cores (requires SPI bus sharing or arbitration).
+
+**Why:** appcpu's original SD write served its purpose during bring-up (verifying PDM audio quality without the server pipeline), but it introduced a coupling: appcpu had to finish a ~150KB SPI write before procpu could begin streaming. That serialised the path. More critically, SD SPI DMA cannot reliably read from PSRAM cache-mapped addresses — we used a DRAM bounce buffer for the write, which consumed significant stack space and complicated appcpu's already-tight memory situation. Moving SD to procpu aligns ownership with the data consumer: procpu already has the PSRAM pointer, the WAV header builder, and the WebSocket client. The SD write becomes a one-liner (`sd_wav_write("/SD:/PROCREC.WAV", shdr)`) at the same point in the code where the WebSocket send happens — easy to toggle for debugging without touching appcpu at all.
+
+**Tradeoff:** Adding SD/FAT to procpu required `CONFIG_SPI`, `CONFIG_DISK_ACCESS`, `CONFIG_FAT_FILESYSTEM_ELM`, and the FatFS structs, which pushed DRAM over budget by 5,768 bytes. Fixed by: placing the `FATFS` struct in PSRAM (`.ext_ram.bss`, saves ~560B), reducing `CONFIG_FS_FATFS_NUM_FILES` and `CONFIG_FS_FATFS_NUM_DIRS` from 4 to 1 (saves ~1.9KB), and reducing `CONFIG_NET_MGMT_EVENT_STACK_SIZE` from 2,048 to 1,024 (saves 1,024B; net_mgmt callback only sets a semaphore).
+
+---
+
+### PCM sent in 4096-byte chunks (TLS record size boundary)
+
+**Decision:** `send_audio_as_wav()` loops over `shdr->pcm` in 4,096-byte chunks, calling `ws_send_binary(pcm, chunk)` per iteration. `#define PCM_CHUNK_BYTES 4096` explicitly matches `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN`.
+
+**Alternatives:** Send the entire PCM buffer in one `ws_send_binary()` call; use a larger chunk size with a larger `MBEDTLS_SSL_MAX_CONTENT_LEN`.
+
+**Why:** `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096` sets the per-TLS-record buffer size. Passing a 150KB buffer to `websocket_send_msg()` does not produce a single 150KB TLS record — internally, mbedTLS tries to allocate a 150KB record buffer, which fails or causes undefined behaviour in the fragmented network buffer pool. In practice, the call returned an error silently and the PCM never reached the server. The right invariant: each `ws_send_binary()` call must not exceed `MBEDTLS_SSL_MAX_CONTENT_LEN`. Making `PCM_CHUNK_BYTES` a named constant equal to that config value keeps the relationship explicit — changing `MBEDTLS_SSL_MAX_CONTENT_LEN` in `prj.conf` requires changing one constant in `main.c` to match.
+
+---
+
+### No DC offset removal in firmware
+
+**Decision:** procpu sends `shdr->pcm` to the server verbatim — no mean subtraction, no high-pass filter, no normalization. Any DC offset in the PDM capture path is left in the audio.
+
+**Alternatives:** Two-pass DC removal (compute mean of the recording, subtract per-sample before streaming); high-pass filter with a pole near DC; normalize RMS to a target level.
+
+**Why:** Whisper (faster-whisper) normalises the audio internally before inference. DC offset in a 16-bit signed PCM recording shifts the waveform's zero crossing but does not clip signal or change spectral content above ~10Hz. Empirically, DC offset did not affect transcription accuracy. The two-pass approach requires reading PSRAM twice (once to compute mean, once to subtract), which doubles the cache invalidation and memory access work before streaming. A single-pass approach requires a PSRAM-resident output buffer (another 160KB). Neither complexity is justified when Whisper does it for free.
 
 ---
 
@@ -430,15 +502,20 @@ That is not something you type from memory. Makefiles are universally understood
 | AMP instead of SMP | Two independent images to maintain; inter-core communication via IPM adds latency and complexity |
 | IPM single-slot, no queue | One message in-flight at a time; back-to-back sends must use `wait=1` (blocking) |
 | USB Serial/JTAG owned by procpu | appcpu cannot log directly; must forward via IPM; log strings truncated at 128 bytes |
-| Self-signed TLS | Browser shows cert warning on first visit; device uses `VERIFY_NONE` (no cert pinning until Milestone 8 LittleFS provisioning) |
-| DRAM headroom 568 bytes | `dram0_0_seg` is 99.7% full. Any new static global or pool increase overflows the linker. All future allocations must target PSRAM. |
+| Self-signed TLS + cert pinning | Browser shows cert warning on first visit; device cert is baked into firmware — updating the server cert requires a firmware reflash |
+| DRAM at capacity | `dram0_0_seg` is ~99.7% full. Any new static global or pool size increase overflows the linker. All future allocations must target PSRAM. |
 | `HEAP_MEM_POOL_SIZE` at floor (45,336) | Cannot reduce below Zephyr's enforced minimum without silently being overridden. Runtime heap is PSRAM via SHARED_MULTI_HEAP; this static pool is DRAM-only. |
 | LittleFS over NVS | More flexible API, but heavier footprint; NVS would be smaller for simple key-value storage |
 | Sentence-boundary TTS | Sentence detection on punctuation is fragile for lists, abbreviations, and decimal numbers |
 | No persistent WebSocket | ~300ms TLS handshake added to each wake latency |
 | Piper TTS (CPU) | Voice quality is good but below neural cloud APIs; no emotional prosody control |
 | Onyx pre-built images | Cannot patch Onyx internals; must wait for upstream to fix bugs in RAG layer |
-| I2S DMA stereo-only | PSRAM buffer holds stereo-interleaved PCM; right channel (zeros) must be stripped before WAV streaming — doubles memory and bandwidth for a mono mic |
+| I2S DMA stereo-only | ESP32-S3 GDMA forces `channels=2`; mono conversion (strip right channel) happens per-block on appcpu during capture, adding per-block CPU cost on appcpu |
 | PSRAM cache flush/invalidate | Small latency penalty at recording boundaries; required for correctness — without it procpu may read stale cache data silently |
 | Explicit DTS overlay paths | Overlay variable prefix must match sysbuild application name exactly; wrong prefix silently has no effect |
 | k_work button deferral | Work handler reads pin state after ISR fires — rapid double-edges collapse into one handler call; acceptable for a human-pressed button |
+| Runtime PSRAM address via IPM | appcpu must wait up to 5s at boot for the address message; if procpu never sends it, appcpu falls back to compile-time constant |
+| SD card on procpu | Adds SD/FAT Kconfig to procpu (DRAM cost mitigated by PSRAM FATFS struct + pool reductions); debug WAV write is sequential with WS send — acceptable latency |
+| PCM chunked at 4,096 bytes | `send_audio_as_wav()` loops ~38 times for a 5s recording; each iteration is a separate TLS record; adds modest per-chunk TLS overhead |
+| No DC offset removal | Relies on Whisper's internal normalisation; a future non-Whisper STT backend may not normalise and could be affected |
+| `vad_filter=True` in Whisper | 500ms silence threshold: too short may clip trailing words; too long delays transcription start |

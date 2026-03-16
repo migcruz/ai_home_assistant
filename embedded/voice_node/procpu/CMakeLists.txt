@@ -11,4 +11,6 @@ target_sources(
     src/audio.c
     src/wifi.c
     src/websocket.c
+    ../common/sd_wav.c
     )
+target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)

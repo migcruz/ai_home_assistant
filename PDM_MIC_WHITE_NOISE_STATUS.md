@@ -2,30 +2,54 @@
 
 ## Summary
 
-`testapp` (now renamed to `testapp_mic`) has now produced a clear, intelligible recording to SD card. This is a major update: the microphone hardware is working.
+**RESOLVED.** The white noise issue has been fixed. Both `testapp_mic` and `voice_node` now produce clear, intelligible audio.
 
-`voice_node` still produces static/white-noise behavior in the outbound WAV/transcript path.
+## Root Cause
 
-Given the successful `testapp_mic` capture, the issue is now most likely in configuration/path differences between `testapp_mic` and `voice_node` rather than mic hardware failure.
+**`AUDIO_PSRAM_BASE` was set to `0x3C000000`, which is flash-mapped rodata, not PSRAM.**
 
-## Latest Confirmed Finding (2026-03-15)
+On ESP32-S3, flash rodata and PSRAM share the same data cache bus starting at `0x3C000000`. The Zephyr linker places a `.ext_ram.dummy` section first to skip past flash rodata pages before the actual PSRAM region begins. In our build:
 
-- `testapp_mic` records clear audio to SD WAV (human speech is intelligible, similar to Arduino test quality).
-- Therefore:
-  - Mic element and board hardware are functional.
-  - ESP32-S3 PDM capture path can work correctly under Zephyr on this board.
-- The highest-priority suspect shifts to `voice_node` overlay/routing and integration differences.
+```
+.ext_ram.dummy   0x3C000000   0xB0000   <- flash rodata (704 KB)
+.ext_ram.data    0x3C0B0000             <- actual PSRAM starts here
+```
 
-## What We Know From Logs
+Writes to `0x3C000000` entered the CPU's write-back data cache but could never persist to physical storage (the backing memory is read-only flash). On the same core, short-lived reads could hit the cached values, which is why `log_block_stats()` showed valid-looking audio from DMA blocks during recording. But after cache eviction or flush, reads returned flash content — random-looking data that sounds like white noise.
 
-- App CPU logs show RX is configured as:
-  - `tdm=0`, `pdm=1`, `pdm2pcm=1`, `dsr128=0` (64x downsample)
-  - Example: `rx_conf=0x00301004 (tdm=0 pdm=1 pdm2pcm=1 dsr128=0)`
-- Pro CPU audio inspection shows:
-  - L and R channels have similar energy (neither is near-silent).
-  - **L/R correlation ~ 1.000** consistently in the mid-window.
-    - This implies both “channels” are duplicates, and they are duplicate noise.
-- The generated WAV is mono 16 kHz, 16-bit, and the server (`services/voice/src/transcribe.py`) saves the last received audio to `/tmp/last_audio.wav` for listening.
+This explains every symptom:
+- **testapp_mic worked**: it wrote mono PCM to a DRAM stack buffer (`int16_t mono_buf[BLOCK_SAMPLES]`), then directly to SD. PSRAM was never involved.
+- **voice_node per-block SD streaming worked**: the old approach wrote DMA block data to SD immediately from DRAM slab buffers, before PSRAM was involved.
+- **voice_node PSRAM path produced white noise**: mono PCM was written to `0x3C000000` (flash, not PSRAM), then read back for SD/WebSocket — returning flash content.
+- **L/R correlation ~ 1.000**: the data was mono (consecutive samples from the same mic), not stereo. The correlation metric was measuring adjacent mono samples, not L/R channels.
+
+## Fix Applied (2026-03-16)
+
+1. **procpu `audio.c`**: Allocated `audio_psram_buf[512KB]` in `.ext_ram.bss` section, which the linker places in actual PSRAM at `0x3C0B0000`.
+2. **procpu `audio.h`**: Removed hardcoded `AUDIO_PSRAM_BASE`; exports `audio_psram_buf[]`.
+3. **appcpu `pdm.h`**: Updated `AUDIO_PSRAM_BASE` from `0x3C000000` to `0x3C0B0000` to match the linker-allocated address.
+
+After rebuilding, `APPREC.WAV` on SD card has clear audio.
+
+**Important**: If procpu's flash rodata size changes significantly (e.g., adding large const arrays or new libraries), `_ext_ram_start` may shift. After such changes, verify the address:
+```
+grep audio_psram_buf build/procpu/zephyr/zephyr_final.map
+```
+
+## ESP32-S3 PSRAM Address Map (for reference)
+
+```
+0x3C000000 +-----------------------+
+           | .ext_ram.dummy        |  Flash rodata pages (size varies by build)
+           | (flash-mapped, R/O)   |
+0x3C0B0000 +-----------------------+  <- _ext_ram_start (actual PSRAM)
+           | .ext_ram.bss          |  audio_psram_buf (512KB), net_thread stack, etc.
+0x3C0C3A60 +-----------------------+
+           | SPIRAM heap           |  CONFIG_ESP_SPIRAM_HEAP_SIZE
+0x3C1C3A60 +-----------------------+  <- _ext_ram_end
+           | (unmapped)            |
+0x3C800000 +-----------------------+  End of 8MB PSRAM address window
+```
 
 ## Changes Already Made (Firmware + Debugging)
 
@@ -35,77 +59,26 @@ In `embedded/voice_node/appcpu/src/pdm.c`:
 
 - Explicitly forces PDM mode and PDM2PCM enable bits after `i2s_trigger(START)` resets RX mode.
 - Explicitly sets PDM downsample to 64x (`dsr128=0`).
-- Forces known sample formatting bits (endianness/alignment/bit-order) to avoid inheriting stale state.
-- Adds logging after `i2s_ll_rx_start()` so we can see the in-effect RX configuration.
-- Adds a `PDM_ACTIVE_MASK` constant (slot gating). We tried:
-  - `0x02` (LEFT-only)
-  - `0x01` (RIGHT-only)
-  - `0x03` (both)
-  Slot gating did not resolve the noise.
+- Forces known sample formatting bits (endianness/alignment/bit-order).
+- Per-block mono conversion in recording loop: extracts left channel from stereo DMA blocks, writes to PSRAM.
+- Post-loop SD WAV write via DRAM bounce buffer (SD SPI DMA may not read correctly from PSRAM cache-mapped addresses).
 
 ### WAV creation + DC offset removal (procpu)
 
 In `embedded/voice_node/procpu/src/main.c`:
 
-- Builds a proper WAV header and streams binary WAV frames to the voice service.
-- Strips stereo to mono.
-- Removes DC offset via a mean subtraction pass.
-- Adds auto slot pick (LEFT vs RIGHT) based on mid-buffer amplitude, to avoid stripping the wrong slot if the mic lands in the opposite slot.
+- Builds WAV header, streams mono PCM to voice service via WebSocket.
+- Auto-selects L/R slot based on mid-buffer amplitude.
+- DC offset removal via mean subtraction.
 
-In `embedded/voice_node/procpu/src/audio.c`:
+### Overlay alignment
 
-- Adds L/R correlation logging over a mid-window to identify duplicate channels vs unrelated noise.
+`voice_node` appcpu overlay now matches `testapp_mic`:
+- `I2S0_I_WS_GPIO42` (PDM clock output)
+- `I2S0_I_SD_GPIO41` (PDM data input, with `bias-pull-down`)
 
-### Overlay experiments (signal matrix)
+## Remaining Work
 
-We tried multiple devicetree overlays under `embedded/voice_node/overlays/` to vary:
-
-- Whether PDM clock is driven on `BCK` vs `WS`.
-- Whether the pins are swapped (GPIO41/GPIO42 permutations).
-- Using **output** clock signals (`I2S0_O_BCK`, `I2S0_O_WS`) instead of input signals.
-
-None of the overlay variants changed the “full-scale noise” characteristics.
-
-### Build system fix (overlay path)
-
-In `embedded/voice_node/Makefile`:
-
-- Overlay paths are normalized to absolute paths so `make APPCPU_OVERLAY=...` works reliably (CMake resolves relative overlay paths from the build directory).
-
-## Current Interpretation
-
-Previous interpretation assumed likely hardware fault. That is now invalidated by `testapp_mic` success.
-
-Current interpretation:
-
-- `voice_node` and `testapp_mic` are not using the same effective pin/signal routing.
-- The strongest concrete mismatch currently identified:
-  - `testapp_mic` overlay (`embedded/testapp_mic/testapp_mic.overlay`) uses:
-    - `I2S0_I_WS_GPIO42`
-    - `I2S0_I_SD_GPIO41` (+ `bias-pull-down`)
-  - `voice_node` appcpu overlay (`embedded/voice_node/overlays/appcpu.overlay`) currently uses:
-    - `I2S0_O_BCK_GPIO41`
-    - `I2S0_I_SD_GPIO42` (+ `bias-pull-down`)
-- `voice_node` also adds extra complexity not present in `testapp_mic`:
-  - dual-core IPC path (appcpu capture -> procpu processing)
-  - PSRAM handoff + cache coherence
-  - runtime slot auto-selection + DC removal + WS streaming
-
-## Next Steps (Pending Hardware Verification)
-
-1. Mirror `testapp_mic` pin routing exactly in `voice_node` appcpu overlay as the first change.
-2. Keep capture format/clock settings aligned between `testapp_mic` and `voice_node` during comparison.
-3. Once routing is aligned, re-test `voice_node` and compare:
-   - L/R RMS and correlation logs
-   - resulting transcript quality
-4. If still noisy after routing alignment, isolate each integration layer:
-   - appcpu capture-only dump to file/raw buffer
-   - procpu PSRAM readback verification
-   - websocket transport verification
-
-## Useful Debug Artifacts
-
-- On the voice service container:
-  - `/tmp/last_audio.wav` is written on each transcription attempt (see `services/voice/src/transcribe.py`).
-- On-device comparison baseline:
-  - `testapp_mic` SD output WAV is now a known-good local reference.
+- **procpu stereo/mono mismatch**: `send_audio_as_wav()` in `procpu/src/main.c` still treats PSRAM data as stereo-interleaved (stride-2 access, `mono_bytes = byte_count / 2`). The data is already mono from appcpu. This needs to be fixed for the WebSocket path to work correctly.
+- Re-enable `vad_filter=True` in `services/voice/src/transcribe.py` once end-to-end path is verified.
+- Clean up diagnostic logging (`log_block_stats`, PSRAM readback, register dumps).

@@ -34,6 +34,7 @@
 #include "wifi.h"
 #include "websocket.h"
 #include "server_cert.h"
+#include "sd_wav.h"
 
 LOG_MODULE_DECLARE(procpu, LOG_LEVEL_DBG);
 
@@ -67,6 +68,23 @@ static volatile bool connected;
 #define CONFIG_MSG \
 	"{\"type\":\"config\",\"tts\":true," \
 	"\"audio_format\":\"wav\",\"sample_rate\":16000}"
+
+/*
+ * Receive buffer for inbound TTS WAV frames (Milestone 4).
+ *
+ * The server sends one complete WAV per sentence via a single ws.send_bytes()
+ * call.  websocket_recv_msg() may return it in multiple chunks (RECV_BUF_SIZE
+ * at a time); chunks are accumulated here until remaining == 0, then the full
+ * sentence WAV is written to SD.
+ *
+ * 200KB covers sentences up to ~4.5s at 22050Hz 16-bit mono with headroom.
+ * Placed in PSRAM — costs zero DRAM.
+ */
+#define RX_WAV_BUF_SIZE (200 * 1024)
+static uint8_t rx_wav_buf[RX_WAV_BUF_SIZE]
+	__attribute__((section(".ext_ram.bss")));
+static size_t rx_wav_len;
+static int    rx_wav_idx;  /* sentence counter — increments across sessions */
 
 /* ── TLS socket + TCP connect ────────────────────────────────────────────── */
 
@@ -224,6 +242,8 @@ static int ws_connect_and_run(void)
 	uint32_t msg_type;
 	uint64_t remaining;
 
+	rx_wav_len = 0;  /* reset accumulator for this session */
+
 	while (1) {
 		int ret = websocket_recv_msg(wfd, buf, sizeof(buf) - 1,
 					     &msg_type, &remaining,
@@ -248,9 +268,45 @@ static int ws_connect_and_run(void)
 			buf[ret] = '\0';
 			LOG_INF("[C0] WS rx text: %s", (char *)buf);
 		} else if (msg_type & WEBSOCKET_FLAG_BINARY) {
-			LOG_INF("[C0] WS rx binary: %d bytes "
-				"(remaining: %lld)", ret, remaining);
-			/* TODO (Milestone 4): queue WAV frame for I2S playback */
+			/* Accumulate chunks from this WAV frame into PSRAM. */
+			if (rx_wav_len + ret <= RX_WAV_BUF_SIZE) {
+				memcpy(rx_wav_buf + rx_wav_len, buf, ret);
+				rx_wav_len += ret;
+			} else {
+				LOG_ERR("[C0] RX WAV overflow (%zu + %d > %d) "
+					"— dropping sentence %d",
+					rx_wav_len, ret,
+					RX_WAV_BUF_SIZE, rx_wav_idx);
+				rx_wav_len = 0;
+			}
+
+			LOG_DBG("[C0] WS rx binary chunk: %d bytes "
+				"(accumulated: %zu, remaining: %lld)",
+				ret, rx_wav_len, remaining);
+
+			/* Frame complete — write the sentence WAV to SD. */
+			if (remaining == 0 && rx_wav_len > 0) {
+				char path[32];
+
+				snprintf(path, sizeof(path),
+					 "/SD:/RXAUD%02d.WAV", rx_wav_idx++);
+
+				struct sd_seg segs[] = {
+					{ rx_wav_buf, rx_wav_len },
+				};
+
+				int err = sd_write_file(path, segs,
+							ARRAY_SIZE(segs));
+
+				if (err < 0) {
+					LOG_ERR("[C0] SD write failed: %d", err);
+				} else {
+					LOG_INF("[C0] saved %s (%zu bytes)",
+						path, rx_wav_len);
+				}
+
+				rx_wav_len = 0;
+			}
 		}
 	}
 

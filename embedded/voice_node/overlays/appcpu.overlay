@@ -47,9 +47,35 @@
 	};
 };
 
-/* DMA controller required by the I2S driver (i2s0 uses channels 2/3) */
+/* DMA controller — shared by I2S0 (PDM RX) and I2S1 (speaker TX) */
 &dma {
 	status = "okay";
+};
+
+/*
+ * I2S1 TX — MAX98357A Class D amplifier
+ *   BCLK  GPIO2
+ *   LRCLK GPIO3
+ *   DOUT  GPIO4  (data out of ESP32 → DIN on MAX98357A)
+ *
+ * appcpu owns both I2S peripherals to avoid cross-core GDMA conflicts:
+ * if procpu initialises its own I2S driver the GDMA global init corrupts
+ * appcpu's I2S0 channel setup.
+ */
+&pinctrl {
+	i2s1_tx_default: i2s1_tx_default {
+		group1 {
+			pinmux = <I2S1_O_BCK_GPIO2>,
+				 <I2S1_O_WS_GPIO3>,
+				 <I2S1_O_SD_GPIO4>;
+		};
+	};
+};
+
+&i2s1 {
+	status = "okay";
+	pinctrl-0 = <&i2s1_tx_default>;
+	pinctrl-names = "default";
 };
 
 &i2s0 {

@@ -26,7 +26,7 @@
 #include "wifi.h"
 #include "websocket.h"
 #include "ipm_ids.h"
-#include "sd_wav.h"
+/* #include "sd_wav.h" — re-enable with SD/FAT Kconfig for audio debug */
 
 LOG_MODULE_REGISTER(procpu, LOG_LEVEL_DBG);
 
@@ -169,6 +169,10 @@ int main(void)
 	uint32_t buf_addr = (uint32_t)(uintptr_t)audio_psram_buf;
 	ipm_send(ipm_dev, 1, IPM_ID_BUFADDR, &buf_addr, sizeof(buf_addr));
 	LOG_INF("[C0] sent audio buf addr 0x%08X to appcpu", buf_addr);
+
+	uint32_t play_addr = (uint32_t)(uintptr_t)play_buf;
+	ipm_send(ipm_dev, 1, IPM_ID_PLAYBUFADDR, &play_addr, sizeof(play_addr));
+	LOG_INF("[C0] sent play buf addr 0x%08X to appcpu", play_addr);
 
 	if (button_init(ipm_dev) < 0) {
 		return -1;

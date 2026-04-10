@@ -1,14 +1,20 @@
 /*
  * appcpu — APP CPU (Core 1)
  *
- * Waits for CMD_START from procpu via IPM, captures PDM audio into shared
- * PSRAM using pdm_record(), then signals procpu via IPM with the byte count.
+ * Owns all I2S/DMA on the ESP32-S3:
+ *   I2S0 — PDM mic capture (MSM261S4030H0R)
+ *   I2S1 — TTS WAV playback (MAX98357A, Milestone 4)
+ *
+ * Keeping both I2S peripherals on one core avoids cross-core GDMA hardware
+ * conflicts: procpu's GDMA global init corrupts appcpu's I2S0 setup when
+ * procpu also enables an I2S driver.
  *
  * IPM message IDs (shared with procpu/src/main.c):
  *   id=0  appcpu → procpu   log string
  *   id=1  procpu → appcpu   command: uint8_t 1=start, 0=stop
  *   id=2  appcpu → procpu   done:    signal only (byte_count lives in struct audio_shared)
  *   id=3  procpu → appcpu   buf_addr: uint32_t address of audio_psram_buf
+ *   id=4  procpu → appcpu   play:    struct ipm_play_msg {addr, len} — WAV in PSRAM
  */
 
 #include <zephyr/kernel.h>
@@ -19,6 +25,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include "pdm.h"
+#include "play.h"
 #include "ipm_ids.h"
 
 static const struct device *ipm_dev;
@@ -26,6 +33,11 @@ static const struct device *ipm_dev;
 static volatile bool     recording    = false;
 static volatile bool     stop_pending = false;
 static volatile uint32_t audio_buf_addr = 0;
+
+static volatile bool     play_pending  = false;
+static volatile uint32_t play_buf_addr = 0;
+
+#define APPCPU_LOOPBACK_USE_TEST_TONE 1
 
 static void ipm_log(const char *fmt, ...)
 {
@@ -56,6 +68,10 @@ static void ipm_rx_cb(const struct device *dev, void *ctx,
 		}
 	} else if (id == IPM_ID_BUFADDR) {
 		audio_buf_addr = *(volatile uint32_t *)data;
+	} else if (id == IPM_ID_PLAYBUFADDR) {
+		play_buf_addr = *(volatile uint32_t *)data;
+	} else if (id == IPM_ID_PLAY) {
+		play_pending = true;
 	}
 }
 
@@ -95,23 +111,48 @@ int main(void)
 		return -1;
 	}
 
-	ipm_log("[C1] PDM ready — waiting for start command");
+	if (play_init(ipm_dev) < 0) {
+		ipm_log("[C1] I2S1 play init failed — speaker disabled");
+		/* Non-fatal: continue without playback */
+	} else {
+		ipm_log("[C1] I2S1 playback ready (MAX98357A)");
+	}
+
+	ipm_log("[C1] ready — waiting for commands");
 
 	while (1) {
-		if (!recording) {
+		if (recording) {
+			(void)pdm_record(&stop_pending);
+
+			recording    = false;
+			stop_pending = false;
+
+			/* Speaker diagnostic mode: generated tone isolates TX/amp path
+			 * from recorded mic data/PSRAM content. */
+#if APPCPU_LOOPBACK_USE_TEST_TONE
+			int perr = play_test_tone(1000U, 880U);
+#else
+			/* Speaker loopback test — play back the recording immediately.
+			 * Remove once Milestone 5 (full round-trip) is validated. */
+			int perr = play_audio_shared(audio_buf_addr, play_buf_addr);
+#endif
+			if (perr < 0) {
+				ipm_log("[C1] loopback play failed: %d", perr);
+			}
+
+			/* Signal procpu that audio is ready. */
+			uint8_t done = 1U;
+			ipm_send(ipm_dev, 1, IPM_ID_DONE, &done, sizeof(done));
+		} else if (play_pending) {
+			play_pending = false;
+
+			int err = play_from_shared(play_buf_addr);
+			if (err < 0) {
+				ipm_log("[C1] play_from_shared failed: %d", err);
+			}
+		} else {
 			k_sleep(K_MSEC(10));
-			continue;
 		}
-
-		(void)pdm_record(&stop_pending);
-
-		recording    = false;
-		stop_pending = false;
-
-		/* Signal procpu that audio is ready; byte_count lives in the
-		 * struct audio_shared header already flushed to PSRAM. */
-		uint8_t done = 1U;
-		ipm_send(ipm_dev, 1, IPM_ID_DONE, &done, sizeof(done));
 	}
 
 	return 0;

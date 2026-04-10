@@ -11,6 +11,6 @@ target_sources(
     src/audio.c
     src/wifi.c
     src/websocket.c
-    ../common/sd_wav.c
+    # ../common/sd_wav.c  # re-enable with SD/FAT Kconfig for audio debug
     )
 target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)

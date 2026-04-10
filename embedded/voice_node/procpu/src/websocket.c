@@ -31,10 +31,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <zephyr/drivers/ipm.h>
+#include <zephyr/cache.h>
 #include "wifi.h"
 #include "websocket.h"
 #include "server_cert.h"
-#include "sd_wav.h"
+#include "ipm_ids.h"
+#include "audio.h"
+#include "audio_shared.h"
 
 LOG_MODULE_DECLARE(procpu, LOG_LEVEL_DBG);
 
@@ -60,6 +64,9 @@ static struct k_thread net_thread_data;
 static volatile int  ws_fd      = -1;
 static volatile bool connected;
 
+/* IPM device for signalling appcpu to play received TTS audio */
+static const struct device *play_ipm;
+
 /* ── Buffers (stack-allocated inside net_thread — fits in 16KB) ─────────── */
 #define HTTP_BUF_SIZE  512   /* HTTP 101 upgrade response */
 #define RECV_BUF_SIZE  2048  /* incoming WebSocket frames  */
@@ -70,21 +77,13 @@ static volatile bool connected;
 	"\"audio_format\":\"wav\",\"sample_rate\":16000}"
 
 /*
- * Receive buffer for inbound TTS WAV frames (Milestone 4).
- *
- * The server sends one complete WAV per sentence via a single ws.send_bytes()
- * call.  websocket_recv_msg() may return it in multiple chunks (RECV_BUF_SIZE
- * at a time); chunks are accumulated here until remaining == 0, then the full
- * sentence WAV is written to SD.
- *
- * 200KB covers sentences up to ~4.5s at 22050Hz 16-bit mono with headroom.
- * Placed in PSRAM — costs zero DRAM.
+ * Inbound TTS WAV frames are accumulated into play_buf (PSRAM, defined in
+ * audio.c).  Chunks arrive via websocket_recv_msg() until remaining == 0,
+ * at which point procpu flushes the cache and signals appcpu via IPM_ID_PLAY.
  */
-#define RX_WAV_BUF_SIZE (200 * 1024)
-static uint8_t rx_wav_buf[RX_WAV_BUF_SIZE]
-	__attribute__((section(".ext_ram.bss")));
 static size_t rx_wav_len;
 static int    rx_wav_idx;  /* sentence counter — increments across sessions */
+
 
 /* ── TLS socket + TCP connect ────────────────────────────────────────────── */
 
@@ -268,15 +267,15 @@ static int ws_connect_and_run(void)
 			buf[ret] = '\0';
 			LOG_INF("[C0] WS rx text: %s", (char *)buf);
 		} else if (msg_type & WEBSOCKET_FLAG_BINARY) {
-			/* Accumulate chunks from this WAV frame into PSRAM. */
-			if (rx_wav_len + ret <= RX_WAV_BUF_SIZE) {
-				memcpy(rx_wav_buf + rx_wav_len, buf, ret);
+			/* Accumulate chunks into shared PSRAM playback buffer. */
+			if (rx_wav_len + ret <= PLAY_DATA_MAX) {
+				memcpy(play_buf->wav + rx_wav_len, buf, ret);
 				rx_wav_len += ret;
 			} else {
-				LOG_ERR("[C0] RX WAV overflow (%zu + %d > %d) "
+				LOG_ERR("[C0] RX WAV overflow (%zu + %d > %u) "
 					"— dropping sentence %d",
 					rx_wav_len, ret,
-					RX_WAV_BUF_SIZE, rx_wav_idx);
+					PLAY_DATA_MAX, rx_wav_idx);
 				rx_wav_len = 0;
 			}
 
@@ -284,25 +283,23 @@ static int ws_connect_and_run(void)
 				"(accumulated: %zu, remaining: %lld)",
 				ret, rx_wav_len, remaining);
 
-			/* Frame complete — write the sentence WAV to SD. */
+			/* Frame complete — write header, flush PSRAM, signal appcpu. */
 			if (remaining == 0 && rx_wav_len > 0) {
-				char path[32];
+				play_buf->magic = PLAY_SHARED_MAGIC;
+				play_buf->len   = (uint32_t)rx_wav_len;
 
-				snprintf(path, sizeof(path),
-					 "/SD:/RXAUD%02d.WAV", rx_wav_idx++);
+				sys_cache_data_flush_range(
+					play_buf,
+					sizeof(struct play_shared) + rx_wav_len);
 
-				struct sd_seg segs[] = {
-					{ rx_wav_buf, rx_wav_len },
-				};
+				LOG_INF("[C0] RX WAV %d: %zu bytes — signalling appcpu",
+					rx_wav_idx++, rx_wav_len);
 
-				int err = sd_write_file(path, segs,
-							ARRAY_SIZE(segs));
-
+				uint8_t sig = 1U;
+				int err = ipm_send(play_ipm, 1, IPM_ID_PLAY,
+						   &sig, sizeof(sig));
 				if (err < 0) {
-					LOG_ERR("[C0] SD write failed: %d", err);
-				} else {
-					LOG_INF("[C0] saved %s (%zu bytes)",
-						path, rx_wav_len);
+					LOG_ERR("[C0] IPM play failed: %d", err);
 				}
 
 				rx_wav_len = 0;
@@ -350,6 +347,8 @@ static void net_thread_fn(void *a, void *b, void *c)
 
 void net_thread_start(void)
 {
+	play_ipm = DEVICE_DT_GET(DT_NODELABEL(ipm0));
+
 	/* Register the pinned server CA cert once at startup.
 	 * sizeof() includes the null terminator which mbedTLS expects. */
 	int ret = tls_credential_add(VOICE_CA_TAG,

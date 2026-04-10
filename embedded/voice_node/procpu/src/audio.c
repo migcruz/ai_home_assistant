@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "audio_shared.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/cache.h>
@@ -9,19 +10,23 @@
 LOG_MODULE_DECLARE(procpu, LOG_LEVEL_DBG);
 
 /*
- * Shared audio buffer in PSRAM, allocated via the linker's .ext_ram.bss section.
- * appcpu writes PCM here during recording; procpu reads after IPM "done" signal.
- *
- * NOTE: 0x3C000000 is NOT PSRAM — it's flash-mapped rodata.  Actual PSRAM starts
- * after the .ext_ram.dummy section (currently ~0x3C0B0000).  This buffer is
- * placed by the linker at the correct PSRAM address.  After building, check the
- * map file for the actual address and update AUDIO_PSRAM_BASE in both
- * procpu/src/audio.h and appcpu/src/pdm.h to match.
+ * Shared audio record buffer in PSRAM.
+ * appcpu writes PCM here during recording; procpu reads after IPM_ID_DONE.
  */
 uint8_t audio_psram_buf[AUDIO_BUF_MAX]
 	__attribute__((section(".ext_ram.bss"))) __attribute__((aligned(64)));
 
 const uint8_t * const audio_buf = audio_psram_buf;
+
+/*
+ * Shared audio playback buffer in PSRAM.
+ * procpu writes WAV here (struct play_shared header + wav[]); appcpu reads
+ * and plays after IPM_ID_PLAY signal.
+ */
+uint8_t play_psram_buf[PLAY_BUF_MAX]
+	__attribute__((section(".ext_ram.bss"))) __attribute__((aligned(64)));
+
+struct play_shared * const play_buf = (struct play_shared *)play_psram_buf;
 
 void log_audio_samples(uint32_t byte_count)
 {

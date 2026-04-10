@@ -36,3 +36,30 @@ struct audio_shared {
 
 /* Maximum PCM bytes that fit after the header. */
 #define AUDIO_PCM_MAX  (AUDIO_BUF_MAX - (uint32_t)sizeof(struct audio_shared))
+
+/* ── Playback shared buffer ────────────────────────────────────────────────── */
+
+/*
+ * Shared PSRAM playback buffer layout.
+ *
+ * procpu receives TTS WAV frames over WebSocket and writes them here.
+ * It then flushes the cache and sends IPM_ID_PLAY to appcpu (signal only).
+ * appcpu invalidates its cache, reads len, and plays wav[].
+ *
+ * Physical address is negotiated at boot via IPM_ID_PLAYBUFADDR — procpu
+ * sends the runtime address of its linker-allocated play_psram_buf[] to
+ * appcpu.
+ *
+ * Total buffer size: PLAY_BUF_MAX bytes.
+ * Covers sentences up to ~4.5 s at 22050 Hz, 16-bit, mono (with headroom).
+ */
+#define PLAY_BUF_MAX       (200U * 1024U)
+#define PLAY_SHARED_MAGIC  0x504C4159U  /* "PLAY" */
+
+struct play_shared {
+	uint32_t magic;  /* PLAY_SHARED_MAGIC — sanity check                */
+	uint32_t len;    /* byte length of the WAV in wav[] (set by procpu) */
+	uint8_t  wav[];  /* raw WAV bytes (header + PCM) follow immediately */
+};
+
+#define PLAY_DATA_MAX  (PLAY_BUF_MAX - (uint32_t)sizeof(struct play_shared))

@@ -28,6 +28,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/ipm.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/cache.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
@@ -71,10 +72,12 @@ static void play_log(const char *fmt, ...)
  */
 #define BLOCK_SIZE   4096
 #define BLOCK_COUNT  4
+#define AMP_UNMUTE_DELAY_MS 20U
 
 K_MEM_SLAB_DEFINE_STATIC(play_slab, BLOCK_SIZE, BLOCK_COUNT, 4);
 
 static const struct device *i2s_dev;
+static const struct gpio_dt_spec amp_en = GPIO_DT_SPEC_GET(DT_ALIAS(amp_en), gpios);
 /* Large enough for ~1.5 s @ 16kHz mono. */
 #define TONE_MAX_SAMPLES 24000U
 static int16_t tone_buf[TONE_MAX_SAMPLES];
@@ -165,6 +168,17 @@ int play_init(const struct device *ipm)
 		return -ENODEV;
 	}
 
+	if (!gpio_is_ready_dt(&amp_en)) {
+		play_log("[C1] amp_en GPIO not ready");
+		return -ENODEV;
+	}
+
+	int ret = gpio_pin_configure_dt(&amp_en, GPIO_OUTPUT_INACTIVE);
+	if (ret < 0) {
+		play_log("[C1] amp_en configure failed: %d", ret);
+		return ret;
+	}
+
 	return 0;
 }
 
@@ -204,6 +218,9 @@ static size_t wav_data_offset(const uint8_t *wav, size_t len)
 static int play_pcm(uint32_t sample_rate, const int16_t *mono, size_t n_mono,
 		    bool tts_cleanup)
 {
+	/* Keep amplifier muted during I2S TX startup transient. */
+	(void)gpio_pin_set_dt(&amp_en, 0);
+
 	/* Reset TX state between button-driven plays. */
 	(void)i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
 
@@ -271,6 +288,9 @@ static int play_pcm(uint32_t sample_rate, const int16_t *mono, size_t n_mono,
 		return ret;
 	}
 
+	k_sleep(K_MSEC(AMP_UNMUTE_DELAY_MS));
+	(void)gpio_pin_set_dt(&amp_en, 1);
+
 	int feed_count = 0;
 	int write_errors = 0;
 
@@ -319,6 +339,7 @@ static int play_pcm(uint32_t sample_rate, const int16_t *mono, size_t n_mono,
 	uint32_t free_after = k_mem_slab_num_free_get(&play_slab);
 
 	play_log("[C1] play_pcm: drain done free=%u/%d", free_after, BLOCK_COUNT);
+	(void)gpio_pin_set_dt(&amp_en, 0);
 
 	/* If drain timed out (driver errored mid-playback), force-clean state. */
 	if (free_after < BLOCK_COUNT) {

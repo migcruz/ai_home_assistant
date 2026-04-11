@@ -8,10 +8,23 @@
 #include <zephyr/dt-bindings/pinctrl/esp-pinctrl-common.h>
 #include <zephyr/dt-bindings/pinctrl/esp32s3-gpio-sigmap.h>
 #include <zephyr/dt-bindings/pinctrl/esp32s3-pinctrl.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
 
 / {
 	chosen {
 		zephyr,console = &usb_serial;
+	};
+
+	aliases {
+		amp-en = &amp_en;
+	};
+
+	amp_ctrl: amp-ctrl {
+		compatible = "gpio-leds";
+		amp_en: amp-en {
+			/* MAX98357A SD/EN gate pin (high=enable, low=mute). */
+			gpios = <&gpio0 5 GPIO_ACTIVE_HIGH>;
+		};
 	};
 };
 

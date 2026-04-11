@@ -33,6 +33,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <limits.h>
 
 LOG_MODULE_DECLARE(appcpu, LOG_LEVEL_DBG);
 
@@ -78,6 +79,27 @@ static const struct device *i2s_dev;
 #define TONE_MAX_SAMPLES 24000U
 static int16_t tone_buf[TONE_MAX_SAMPLES];
 
+struct tts_filter_state {
+	int32_t dc_x_prev;
+	int32_t dc_y_prev;
+	int32_t lp_y_prev;
+};
+
+struct tts_filter_config {
+	/* DC blocker coefficient in Q15 (higher = lower cutoff). */
+	int32_t dc_block_a_q15;
+	/* One-pole LP smoothing divisor: y += (x - y) / lp_div. */
+	int32_t lp_div;
+	/* Noise gate threshold (absolute sample value). */
+	int32_t gate_abs_threshold;
+};
+
+static const struct tts_filter_config tts_cfg = {
+	.dc_block_a_q15 = 32604, /* ~0.995 */
+	.lp_div = 4,             /* gentle smoothing */
+	.gate_abs_threshold = 80,
+};
+
 static int16_t apply_edge_fade(int16_t s, size_t idx, size_t total, size_t fade_samples)
 {
 	if (total == 0 || fade_samples == 0) {
@@ -98,6 +120,41 @@ static int16_t apply_edge_fade(int16_t s, size_t idx, size_t total, size_t fade_
 	}
 
 	return (int16_t)(((int32_t)s * gain_q15) / 32767);
+}
+
+/* TTS de-hiss chain:
+ *  1) DC blocker (1st-order high-pass)
+ *  2) Gentle low-pass to tame high-frequency hiss
+ *  3) Small noise gate near zero
+ */
+static int16_t filter_tts_sample(int16_t s, struct tts_filter_state *st)
+{
+	const int32_t lp_div = (tts_cfg.lp_div > 0) ? tts_cfg.lp_div : 1;
+
+	/* y[n] = x[n] - x[n-1] + a*y[n-1]. */
+	int32_t x = s;
+	int32_t y_hp = x - st->dc_x_prev +
+		       ((st->dc_y_prev * tts_cfg.dc_block_a_q15) / 32767);
+	st->dc_x_prev = x;
+	st->dc_y_prev = y_hp;
+
+	/* One-pole LPF: y += (x - y) / lp_div. */
+	int32_t y_lp = st->lp_y_prev + ((y_hp - st->lp_y_prev) / lp_div);
+	st->lp_y_prev = y_lp;
+
+	/* Small gate to suppress idle quantization hiss. */
+	if (y_lp > -tts_cfg.gate_abs_threshold &&
+	    y_lp < tts_cfg.gate_abs_threshold) {
+		y_lp = 0;
+	}
+
+	if (y_lp > INT16_MAX) {
+		y_lp = INT16_MAX;
+	} else if (y_lp < INT16_MIN) {
+		y_lp = INT16_MIN;
+	}
+
+	return (int16_t)y_lp;
 }
 
 int play_init(const struct device *ipm)
@@ -144,7 +201,8 @@ static size_t wav_data_offset(const uint8_t *wav, size_t len)
  * before triggering START (prevents TX underrun → DMA stall → slab hang),
  * then feeds the rest.  mono[] is 16-bit mono PCM; duplicated to stereo L=R.
  */
-static int play_pcm(uint32_t sample_rate, const int16_t *mono, size_t n_mono)
+static int play_pcm(uint32_t sample_rate, const int16_t *mono, size_t n_mono,
+		    bool tts_cleanup)
 {
 	/* Reset TX state between button-driven plays. */
 	(void)i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
@@ -173,18 +231,23 @@ static int play_pcm(uint32_t sample_rate, const int16_t *mono, size_t n_mono)
 	int32_t tx_block[BLOCK_SIZE / 4];
 	const size_t frames_per_block = BLOCK_SIZE / 8; /* 32-bit stereo frames */
 	const size_t fade_samples = MAX((size_t)(sample_rate / 50U), (size_t)1U); /* 20 ms */
+	struct tts_filter_state filt = {0};
 
 	size_t src = 0;
 	int pre_queued = 0;
 
+	// Fill up a few DMA blocks to prevent TX underrun at startup
 	for (int pre = 0; pre < BLOCK_COUNT && src < n_mono; pre++) {
 		size_t n = MIN(frames_per_block, n_mono - src);
 
 		for (size_t i = 0; i < n; i++) {
 			int16_t s = apply_edge_fade(mono[src + i], src + i, n_mono, fade_samples);
-			/* Put 16-bit PCM in the MSBs of the 32-bit left slot. */
+			if (tts_cleanup) {
+				s = filter_tts_sample(s, &filt);
+			}
+			/* Mirror mono to both slots for MAX98357A robustness. */
 			tx_block[i * 2] = ((int32_t)s) << 16;
-			tx_block[i * 2 + 1] = 0;
+			tx_block[i * 2 + 1] = ((int32_t)s) << 16;
 		}
 		if (n < frames_per_block) {
 			memset(&tx_block[n * 2], 0, (frames_per_block - n) * 8);
@@ -211,13 +274,17 @@ static int play_pcm(uint32_t sample_rate, const int16_t *mono, size_t n_mono)
 	int feed_count = 0;
 	int write_errors = 0;
 
+	// Now play the actual audio
 	while (src < n_mono) {
 		size_t n = MIN(frames_per_block, n_mono - src);
 
 		for (size_t i = 0; i < n; i++) {
 			int16_t s = apply_edge_fade(mono[src + i], src + i, n_mono, fade_samples);
+			if (tts_cleanup) {
+				s = filter_tts_sample(s, &filt);
+			}
 			tx_block[i * 2] = ((int32_t)s) << 16;
-			tx_block[i * 2 + 1] = 0;
+			tx_block[i * 2 + 1] = ((int32_t)s) << 16;
 		}
 		if (n < frames_per_block) {
 			memset(&tx_block[n * 2], 0, (frames_per_block - n) * 8);
@@ -280,7 +347,8 @@ static int play_wav(const uint8_t *wav, uint32_t len)
 
 	return play_pcm(sample_rate,
 			(const int16_t *)(wav + data_off),
-			(len - data_off) / 2);
+			(len - data_off) / 2,
+			true);
 }
 
 /*
@@ -308,7 +376,7 @@ int play_audio_shared(uint32_t rec_addr, uint32_t play_buf_addr)
 
 	sys_cache_data_invd_range(as->pcm, byte_count);
 
-	return play_pcm(sample_rate, (const int16_t *)as->pcm, byte_count / 2);
+	return play_pcm(sample_rate, (const int16_t *)as->pcm, byte_count / 2, false);
 }
 
 int play_from_shared(uint32_t psram_addr)
@@ -363,5 +431,5 @@ int play_test_tone(uint32_t duration_ms, uint32_t freq_hz)
 		tone_buf[i] = (int16_t)((centered * amp) / 32767);
 	}
 
-	return play_pcm(sample_rate, tone_buf, n);
+	return play_pcm(sample_rate, tone_buf, n, false);
 }

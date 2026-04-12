@@ -1,0 +1,7 @@
+# KiCad auto-generated backup directories
+kicad-backups/
+voice_node-backups/
+.history/
+
+# KiCad local settings (workspace layout, display state — not shareable)
+*.kicad_prl
